@@ -5,6 +5,12 @@ import Papa from "papaparse";
 
 type Row = Record<string, string>;
 
+interface ScrapingEvent {
+  type: "scraping";
+  index: number;
+  url: string;
+}
+
 interface ProgressEvent {
   type: "progress";
   completed: number;
@@ -18,15 +24,17 @@ interface DoneEvent {
   results: (Row & { generated_email: string })[];
 }
 
-type SSEEvent = ProgressEvent | DoneEvent;
+type SSEEvent = ScrapingEvent | ProgressEvent | DoneEvent;
 
 export default function Home() {
   const [columns, setColumns] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [fileName, setFileName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [urlColumn, setUrlColumn] = useState<string>("");
   const [isDragging, setIsDragging] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [scrapingUrl, setScrapingUrl] = useState<string | null>(null);
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
   const [results, setResults] = useState<(Row & { generated_email: string })[]>([]);
   const [previewPage, setPreviewPage] = useState(0);
@@ -35,6 +43,11 @@ export default function Home() {
   const abortRef = useRef<AbortController | null>(null);
 
   const PREVIEW_PAGE_SIZE = 10;
+
+  // Detect columns that are likely URLs
+  const urlLikeColumns = columns.filter((c) =>
+    /url|website|site|link|web|domain|linkedin|twitter/i.test(c)
+  );
 
   const parseCSV = useCallback((file: File) => {
     setFileName(file.name);
@@ -48,6 +61,12 @@ export default function Home() {
         setResults([]);
         setProgress({ completed: 0, total: 0 });
         setPreviewPage(0);
+        setUrlColumn("");
+        // Auto-select first URL-like column
+        const firstUrl = cols.find((c) =>
+          /url|website|site|link|web|domain|linkedin|twitter/i.test(c)
+        );
+        if (firstUrl) setUrlColumn(firstUrl);
       },
     });
   }, []);
@@ -73,6 +92,7 @@ export default function Home() {
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
     setGenerating(true);
+    setScrapingUrl(null);
     setResults([]);
     setProgress({ completed: 0, total: rows.length });
     setPreviewPage(0);
@@ -83,7 +103,7 @@ export default function Home() {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows, prompt, batchSize: 5 }),
+        body: JSON.stringify({ rows, prompt, urlColumn: urlColumn || undefined, batchSize: 5 }),
         signal: abortRef.current.signal,
       });
 
@@ -104,7 +124,10 @@ export default function Home() {
           if (!line.startsWith("data: ")) continue;
           try {
             const event: SSEEvent = JSON.parse(line.slice(6));
-            if (event.type === "progress") {
+            if (event.type === "scraping") {
+              setScrapingUrl(event.url);
+            } else if (event.type === "progress") {
+              setScrapingUrl(null);
               setProgress({ completed: event.completed, total: event.total });
               setResults((prev) => {
                 const updated = [...prev];
@@ -112,6 +135,7 @@ export default function Home() {
                 return updated;
               });
             } else if (event.type === "done") {
+              setScrapingUrl(null);
               setResults(event.results);
               setProgress({ completed: event.results.length, total: event.results.length });
             }
@@ -126,12 +150,14 @@ export default function Home() {
       }
     } finally {
       setGenerating(false);
+      setScrapingUrl(null);
     }
   };
 
   const handleStop = () => {
     abortRef.current?.abort();
     setGenerating(false);
+    setScrapingUrl(null);
   };
 
   const downloadCSV = () => {
@@ -161,9 +187,9 @@ export default function Home() {
         <div>
           <h1 className="text-3xl font-bold text-white">Cold Email Personalizer</h1>
           <p className="mt-1 text-gray-400 text-sm">
-            Upload a CSV lead list, write a prompt using{" "}
+            Upload a CSV, scrape lead websites automatically, write a prompt using{" "}
             <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code>{" "}
-            variables, and generate a personalized email for every lead.
+            variables, and generate personalized emails at scale.
           </p>
         </div>
 
@@ -214,29 +240,80 @@ export default function Home() {
                   {copied === col ? "✓ Copied!" : `{${col}}`}
                 </button>
               ))}
+              {/* scraped_content chip always shown when url column is set */}
+              {urlColumn && (
+                <button
+                  onClick={() => copyColumn("scraped_content")}
+                  className="px-3 py-1 rounded-full bg-blue-900 hover:bg-blue-600 text-sm text-blue-300 hover:text-white transition-colors font-mono border border-blue-700"
+                  title="Copy {scraped_content}"
+                >
+                  {copied === "scraped_content" ? "✓ Copied!" : "{scraped_content}"}
+                </button>
+              )}
             </div>
           </section>
         )}
 
-        {/* Step 2: Prompt */}
+        {/* Step 2: Web Scraping */}
+        {columns.length > 0 && (
+          <section className="space-y-3">
+            <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+              Step 2 — Web Scraping (optional)
+            </h2>
+            <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 space-y-3">
+              <p className="text-sm text-gray-400">
+                Select a column that contains website or LinkedIn URLs. The app will scrape each page and make the content available as{" "}
+                <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_content}"}</code>{" "}
+                in your prompt.
+              </p>
+              <div className="flex items-center gap-3">
+                <select
+                  value={urlColumn}
+                  onChange={(e) => setUrlColumn(e.target.value)}
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-blue-500"
+                >
+                  <option value="">— No scraping —</option>
+                  {columns.map((col) => (
+                    <option key={col} value={col}>
+                      {col}
+                      {urlLikeColumns.includes(col) ? " 🔗" : ""}
+                    </option>
+                  ))}
+                </select>
+                {urlColumn && (
+                  <span className="text-xs text-green-400">
+                    ✓ Will scrape <strong>{urlColumn}</strong> for each lead
+                  </span>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Step 3: Prompt */}
         <section className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">Step 2 — Write Your Prompt</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+            {columns.length > 0 ? "Step 3" : "Step 2"} — Write Your Prompt
+          </h2>
           <textarea
-            className="w-full h-48 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
-            placeholder={`Example:\n\nWrite a short, personalized cold email to {first_name} who works as a {job_title} at {company}. Mention their industry ({industry}) and how our product can help them. Keep it under 150 words and end with a clear call to action.`}
+            className="w-full h-52 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
+            placeholder={`Example with web scraping:\n\nHere is some information scraped from {first_name}'s company website at {website}:\n{scraped_content}\n\nUsing the above context, write a short personalized cold email to {first_name}, who is a {job_title} at {company}. Reference something specific from their website. Keep it under 120 words with a clear CTA.`}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
           />
           <p className="text-xs text-gray-500">
-            Use{" "}
-            <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code>{" "}
-            to inject lead data. Claude generates one email per row.
+            Use <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code> to inject lead data.
+            {urlColumn && (
+              <> Use <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_content}"}</code> to inject scraped website text.</>
+            )}
           </p>
         </section>
 
-        {/* Step 3: Generate */}
+        {/* Step 4: Generate */}
         <section className="space-y-4">
-          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">Step 3 — Generate</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+            {columns.length > 0 ? "Step 4" : "Step 3"} — Generate
+          </h2>
           <div className="flex items-center gap-3 flex-wrap">
             <button
               onClick={generating ? handleStop : handleGenerate}
@@ -259,12 +336,21 @@ export default function Home() {
             )}
           </div>
 
+          {/* Status */}
+          {generating && scrapingUrl && (
+            <div className="flex items-center gap-2 text-xs text-yellow-400">
+              <span className="animate-pulse">🔍</span>
+              <span>Scraping <span className="font-mono underline truncate max-w-xs">{scrapingUrl}</span>...</span>
+            </div>
+          )}
+
           {/* Progress bar */}
           {(generating || progress.completed > 0) && (
             <div className="space-y-2">
               <div className="flex justify-between text-xs text-gray-400">
                 <span>
                   {progress.completed.toLocaleString()} / {progress.total.toLocaleString()} emails generated
+                  {urlColumn && " (with web scraping)"}
                 </span>
                 <span>{progressPct}%</span>
               </div>
@@ -291,17 +377,13 @@ export default function Home() {
                     onClick={() => setPreviewPage((p) => Math.max(0, p - 1))}
                     disabled={previewPage === 0}
                     className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-30"
-                  >
-                    ←
-                  </button>
+                  >←</button>
                   <span className="text-gray-400">{previewPage + 1} / {totalPages}</span>
                   <button
                     onClick={() => setPreviewPage((p) => Math.min(totalPages - 1, p + 1))}
                     disabled={previewPage === totalPages - 1}
                     className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-30"
-                  >
-                    →
-                  </button>
+                  >→</button>
                 </div>
               )}
             </div>
@@ -309,33 +391,37 @@ export default function Home() {
               <table className="min-w-full text-sm">
                 <thead>
                   <tr className="bg-gray-900 border-b border-gray-800">
-                    {allColumns.map((col) => (
-                      <th
-                        key={col}
-                        className={`px-4 py-3 text-left font-semibold text-xs uppercase tracking-wide whitespace-nowrap ${
-                          col === "generated_email" ? "text-blue-400 min-w-80" : "text-gray-400"
-                        }`}
-                      >
-                        {col === "generated_email" ? "✉ Generated Email" : col}
-                      </th>
-                    ))}
+                    {allColumns
+                      .filter((col) => col !== "scraped_content")
+                      .map((col) => (
+                        <th
+                          key={col}
+                          className={`px-4 py-3 text-left font-semibold text-xs uppercase tracking-wide whitespace-nowrap ${
+                            col === "generated_email" ? "text-blue-400 min-w-80" : "text-gray-400"
+                          }`}
+                        >
+                          {col === "generated_email" ? "✉ Generated Email" : col}
+                        </th>
+                      ))}
                   </tr>
                 </thead>
                 <tbody>
                   {previewData.map((row, i) => (
                     <tr key={i} className="border-b border-gray-800 hover:bg-gray-900/50">
-                      {allColumns.map((col) => (
-                        <td
-                          key={col}
-                          className={`px-4 py-3 align-top ${
-                            col === "generated_email"
-                              ? "text-gray-200 whitespace-pre-wrap text-xs leading-relaxed min-w-80"
-                              : "text-gray-400 text-xs max-w-32 truncate"
-                          }`}
-                        >
-                          {row[col] ?? ""}
-                        </td>
-                      ))}
+                      {allColumns
+                        .filter((col) => col !== "scraped_content")
+                        .map((col) => (
+                          <td
+                            key={col}
+                            className={`px-4 py-3 align-top ${
+                              col === "generated_email"
+                                ? "text-gray-200 whitespace-pre-wrap text-xs leading-relaxed min-w-80"
+                                : "text-gray-400 text-xs max-w-32 truncate"
+                            }`}
+                          >
+                            {row[col] ?? ""}
+                          </td>
+                        ))}
                     </tr>
                   ))}
                 </tbody>
