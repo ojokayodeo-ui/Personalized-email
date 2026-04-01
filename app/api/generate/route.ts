@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { NextRequest } from "next/server";
 import * as cheerio from "cheerio";
 
+export const maxDuration = 300; // 5 minutes (Vercel Pro / self-hosted)
+
 const client = new Anthropic();
 
 function interpolate(template: string, row: Record<string, string>): string {
@@ -21,11 +23,7 @@ async function scrapeUrl(url: string): Promise<string> {
     if (!res.ok) return "";
     const html = await res.text();
     const $ = cheerio.load(html);
-
-    // Remove non-content elements
     $("script, style, nav, footer, header, noscript, iframe, svg").remove();
-
-    // Prefer meaningful content sections
     const selectors = [
       "main",
       "article",
@@ -34,20 +32,14 @@ async function scrapeUrl(url: string): Promise<string> {
       '[class*="content"]',
       "body",
     ];
-
     let text = "";
     for (const sel of selectors) {
       const el = $(sel);
       if (el.length) {
-        text = el
-          .text()
-          .replace(/\s+/g, " ")
-          .trim();
+        text = el.text().replace(/\s+/g, " ").trim();
         if (text.length > 200) break;
       }
     }
-
-    // Trim to ~1500 chars to keep token usage reasonable
     return text.slice(0, 1500);
   } catch {
     return "";
@@ -69,13 +61,48 @@ async function generateEmail(
   return textBlock && textBlock.type === "text" ? textBlock.text : "";
 }
 
+// Retry with exponential backoff — handles 429 rate limits and transient 5xx errors
+async function generateEmailWithRetry(
+  prompt: string,
+  row: Record<string, string>,
+  maxRetries = 6
+): Promise<string> {
+  let lastError: Error = new Error("Unknown error");
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await generateEmail(prompt, row);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const msg = lastError.message.toLowerCase();
+      const isRateLimit =
+        msg.includes("429") ||
+        msg.includes("rate limit") ||
+        msg.includes("rate_limit") ||
+        msg.includes("overloaded") ||
+        msg.includes("529");
+      const isTransient =
+        isRateLimit ||
+        msg.includes("500") ||
+        msg.includes("503") ||
+        msg.includes("timeout");
+
+      if (!isTransient) throw lastError; // non-retryable, fail fast
+
+      // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s
+      const delay = Math.min(2000 * Math.pow(2, attempt), 60000);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastError;
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.json();
   const {
     rows,
     prompt,
     urlColumn,
-    batchSize = 5,
+    batchSize = 10, // 10 concurrent requests by default
   }: {
     rows: Record<string, string>[];
     prompt: string;
@@ -95,14 +122,31 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       const send = (data: object) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
-        );
+        try {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
+          );
+        } catch {
+          // client disconnected
+        }
       };
 
       const results: (Record<string, string> & {
         generated_email: string;
-      })[] = [];
+      })[] = new Array(rows.length);
+
+      let completed = 0;
+      // Throttle progress events: send at most every 500ms to avoid flooding
+      let lastProgressSent = 0;
+      const PROGRESS_INTERVAL_MS = 500;
+
+      const sendProgress = (index: number, row: Record<string, string> & { generated_email: string }, force = false) => {
+        const now = Date.now();
+        if (force || now - lastProgressSent >= PROGRESS_INTERVAL_MS) {
+          lastProgressSent = now;
+          send({ type: "progress", completed, total: rows.length, row, index });
+        }
+      };
 
       for (let i = 0; i < rows.length; i += batchSize) {
         const batch = rows.slice(i, i + batchSize);
@@ -110,15 +154,16 @@ export async function POST(req: NextRequest) {
         const batchPromises = batch.map(async (row, batchIdx) => {
           const idx = i + batchIdx;
           try {
-            // Scrape URL if a URL column is specified
             let enrichedRow = { ...row };
+
+            // Scrape URL if configured
             if (urlColumn && row[urlColumn]) {
               send({ type: "scraping", index: idx, url: row[urlColumn] });
               const scraped = await scrapeUrl(row[urlColumn]);
               enrichedRow.scraped_content = scraped;
             }
 
-            const email = await generateEmail(prompt, enrichedRow);
+            const email = await generateEmailWithRetry(prompt, enrichedRow);
             return { idx, email, row: enrichedRow };
           } catch (err) {
             const errorMsg =
@@ -131,13 +176,9 @@ export async function POST(req: NextRequest) {
 
         for (const { idx, email, row } of batchResults) {
           results[idx] = { ...row, generated_email: email };
-          send({
-            type: "progress",
-            completed: results.filter(Boolean).length,
-            total: rows.length,
-            row: results[idx],
-            index: idx,
-          });
+          completed++;
+          // Force-send on last item, throttle otherwise
+          sendProgress(idx, results[idx], completed === rows.length);
         }
       }
 
