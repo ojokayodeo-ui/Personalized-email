@@ -7,7 +7,8 @@ export const maxDuration = 300; // 5 minutes (Vercel Pro / self-hosted)
 const client = new Anthropic();
 
 function interpolate(template: string, row: Record<string, string>): string {
-  return template.replace(/\{(\w+)\}/g, (_, key) => row[key] ?? `{${key}}`);
+  // Match {anything} including column names with spaces, e.g. {First Name}
+  return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
 }
 
 async function scrapeUrl(url: string): Promise<string> {
