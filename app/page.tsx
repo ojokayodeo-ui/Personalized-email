@@ -8,6 +8,7 @@ type Row = Record<string, string>;
 interface ScrapingEvent {
   type: "scraping";
   index: number;
+  col: string;
   url: string;
 }
 
@@ -33,15 +34,19 @@ function formatDuration(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+function scrapedVarName(col: string): string {
+  return `scraped_${col.replace(/\s+/g, "_")}`;
+}
+
 export default function Home() {
   const [columns, setColumns] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [fileName, setFileName] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [urlColumn, setUrlColumn] = useState<string>("");
+  const [urlColumns, setUrlColumns] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [scrapingUrl, setScrapingUrl] = useState<string | null>(null);
+  const [scrapingInfo, setScrapingInfo] = useState<{ col: string; url: string } | null>(null);
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
   const [rate, setRate] = useState<number | null>(null); // rows/min
   const [results, setResults] = useState<(Row & { generated_email: string })[]>([]);
@@ -50,7 +55,6 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
-  // For throttling React state updates — only flush UI every 250ms
   const pendingResultsRef = useRef<(Row & { generated_email: string })[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startTimeRef = useRef<number>(0);
@@ -74,11 +78,11 @@ export default function Home() {
         setProgress({ completed: 0, total: 0 });
         setRate(null);
         setPreviewPage(0);
-        setUrlColumn("");
-        const firstUrl = cols.find((c) =>
+        // Auto-select all URL-like columns
+        const autoSelected = cols.filter((c) =>
           /url|website|site|link|web|domain|linkedin|twitter/i.test(c)
         );
-        if (firstUrl) setUrlColumn(firstUrl);
+        setUrlColumns(autoSelected);
       },
     });
   }, []);
@@ -95,17 +99,22 @@ export default function Home() {
     if (file && file.name.endsWith(".csv")) parseCSV(file);
   };
 
+  const toggleUrlColumn = (col: string) => {
+    setUrlColumns((prev) =>
+      prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]
+    );
+  };
+
   const copyColumn = (col: string) => {
     navigator.clipboard.writeText(`{${col}}`);
     setCopied(col);
     setTimeout(() => setCopied(null), 1500);
   };
 
-  // Flush buffered results to React state (throttled to avoid 10k re-renders)
   const flushResults = useCallback(() => {
     const snapshot = [...pendingResultsRef.current];
     setResults(snapshot);
-    const elapsed = (Date.now() - startTimeRef.current) / 1000 / 60; // minutes
+    const elapsed = (Date.now() - startTimeRef.current) / 1000 / 60;
     if (elapsed > 0.05) {
       setRate(Math.round(completedRef.current / elapsed));
     }
@@ -122,7 +131,7 @@ export default function Home() {
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
     setGenerating(true);
-    setScrapingUrl(null);
+    setScrapingInfo(null);
     setResults([]);
     setProgress({ completed: 0, total: rows.length });
     setRate(null);
@@ -140,7 +149,7 @@ export default function Home() {
         body: JSON.stringify({
           rows,
           prompt,
-          urlColumn: urlColumn || undefined,
+          urlColumns,
           batchSize: 10,
         }),
         signal: abortRef.current.signal,
@@ -164,19 +173,18 @@ export default function Home() {
           try {
             const event: SSEEvent = JSON.parse(line.slice(6));
             if (event.type === "scraping") {
-              setScrapingUrl(event.url);
+              setScrapingInfo({ col: event.col, url: event.url });
             } else if (event.type === "progress") {
-              setScrapingUrl(null);
+              setScrapingInfo(null);
               completedRef.current = event.completed;
               pendingResultsRef.current[event.index] = event.row;
               setProgress({ completed: event.completed, total: event.total });
               scheduleFlush();
             } else if (event.type === "done") {
-              setScrapingUrl(null);
+              setScrapingInfo(null);
               pendingResultsRef.current = event.results;
               completedRef.current = event.results.length;
               setProgress({ completed: event.results.length, total: event.results.length });
-              // Force immediate flush on completion
               if (flushTimerRef.current) {
                 clearTimeout(flushTimerRef.current);
                 flushTimerRef.current = null;
@@ -194,7 +202,7 @@ export default function Home() {
       }
     } finally {
       setGenerating(false);
-      setScrapingUrl(null);
+      setScrapingInfo(null);
       if (flushTimerRef.current) {
         clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
@@ -206,7 +214,7 @@ export default function Home() {
   const handleStop = () => {
     abortRef.current?.abort();
     setGenerating(false);
-    setScrapingUrl(null);
+    setScrapingInfo(null);
   };
 
   const downloadCSV = () => {
@@ -319,13 +327,27 @@ export default function Home() {
                   {copied === col ? "✓ Copied!" : `{${col}}`}
                 </button>
               ))}
-              {urlColumn && (
-                <button
-                  onClick={() => copyColumn("scraped_content")}
-                  className="px-3 py-1 rounded-full bg-blue-900 hover:bg-blue-600 text-sm text-blue-300 hover:text-white transition-colors font-mono border border-blue-700"
-                >
-                  {copied === "scraped_content" ? "✓ Copied!" : "{scraped_content}"}
-                </button>
+              {urlColumns.length > 0 && (
+                <>
+                  {urlColumns.map((col) => (
+                    <button
+                      key={`scraped_${col}`}
+                      onClick={() => copyColumn(scrapedVarName(col))}
+                      className="px-3 py-1 rounded-full bg-indigo-900 hover:bg-indigo-700 text-sm text-indigo-300 hover:text-white transition-colors font-mono border border-indigo-700"
+                      title={`Copy {${scrapedVarName(col)}}`}
+                    >
+                      {copied === scrapedVarName(col) ? "✓ Copied!" : `{${scrapedVarName(col)}}`}
+                    </button>
+                  ))}
+                  {urlColumns.length > 1 && (
+                    <button
+                      onClick={() => copyColumn("scraped_content")}
+                      className="px-3 py-1 rounded-full bg-blue-900 hover:bg-blue-600 text-sm text-blue-300 hover:text-white transition-colors font-mono border border-blue-700"
+                    >
+                      {copied === "scraped_content" ? "✓ Copied!" : "{scraped_content}"}
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </section>
@@ -339,33 +361,51 @@ export default function Home() {
             </h2>
             <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 space-y-3">
               <p className="text-sm text-gray-400">
-                Select a column containing website or LinkedIn URLs. The app scrapes each
-                page and makes the text available as{" "}
+                Select one or more columns containing URLs. Each column is scraped and
+                available as{" "}
+                <code className="bg-gray-800 px-1 rounded text-blue-400">
+                  {"{scraped_[ColumnName]}"}
+                </code>
+                {". "}
+                When multiple columns are selected, all scraped text is also combined into{" "}
                 <code className="bg-gray-800 px-1 rounded text-blue-400">
                   {"{scraped_content}"}
-                </code>{" "}
-                in your prompt.
+                </code>
+                .
               </p>
-              <div className="flex items-center gap-3">
-                <select
-                  value={urlColumn}
-                  onChange={(e) => setUrlColumn(e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-blue-500"
-                >
-                  <option value="">— No scraping —</option>
-                  {columns.map((col) => (
-                    <option key={col} value={col}>
-                      {col}
-                      {urlLikeColumns.includes(col) ? " 🔗" : ""}
-                    </option>
-                  ))}
-                </select>
-                {urlColumn && (
-                  <span className="text-xs text-green-400">
-                    ✓ Will scrape <strong>{urlColumn}</strong> for each lead
-                  </span>
-                )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {columns.map((col) => {
+                  const isChecked = urlColumns.includes(col);
+                  const isUrlLike = urlLikeColumns.includes(col);
+                  return (
+                    <label
+                      key={col}
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer border transition-colors ${
+                        isChecked
+                          ? "bg-blue-900/40 border-blue-600 text-blue-200"
+                          : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleUrlColumn(col)}
+                        className="accent-blue-500 w-4 h-4 shrink-0"
+                      />
+                      <span className="text-sm font-mono truncate">{col}</span>
+                      {isUrlLike && (
+                        <span className="ml-auto text-xs text-blue-400 shrink-0">🔗 URL</span>
+                      )}
+                    </label>
+                  );
+                })}
               </div>
+              {urlColumns.length > 0 && (
+                <p className="text-xs text-green-400">
+                  ✓ Scraping {urlColumns.length} column{urlColumns.length > 1 ? "s" : ""}:{" "}
+                  {urlColumns.join(", ")}
+                </p>
+              )}
             </div>
           </section>
         )}
@@ -377,7 +417,7 @@ export default function Home() {
           </h2>
           <textarea
             className="w-full h-52 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
-            placeholder={`Example with web scraping:\n\nHere is info scraped from {first_name}'s company site:\n{scraped_content}\n\nWrite a personalized cold email to {first_name}, {job_title} at {company}. Reference something specific from their site. Under 120 words with a clear CTA.`}
+            placeholder={`Example with web scraping:\n\nHere is info scraped from {First Name}'s company site:\n{scraped_content}\n\nWrite a personalized cold email to {First Name}, {Title} at {Company}. Reference something specific from their site. Under 120 words with a clear CTA.`}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
           />
@@ -387,13 +427,17 @@ export default function Home() {
               {"{column_name}"}
             </code>{" "}
             to inject lead data.
-            {urlColumn && (
+            {urlColumns.length > 0 && (
               <>
                 {" "}Use{" "}
                 <code className="bg-gray-800 px-1 rounded text-blue-400">
                   {"{scraped_content}"}
                 </code>{" "}
-                to inject scraped website text.
+                for all scraped text, or individual{" "}
+                <code className="bg-gray-800 px-1 rounded text-blue-400">
+                  {"{scraped_[ColumnName]}"}
+                </code>{" "}
+                variables.
               </>
             )}
           </p>
@@ -427,11 +471,12 @@ export default function Home() {
           </div>
 
           {/* Scraping indicator */}
-          {generating && scrapingUrl && (
+          {generating && scrapingInfo && (
             <div className="flex items-center gap-2 text-xs text-yellow-400">
               <span className="animate-pulse">🔍</span>
               <span className="truncate max-w-md">
-                Scraping <span className="font-mono">{scrapingUrl}</span>...
+                Scraping <span className="font-semibold">{scrapingInfo.col}</span>:{" "}
+                <span className="font-mono">{scrapingInfo.url}</span>...
               </span>
             </div>
           )}
@@ -442,7 +487,7 @@ export default function Home() {
               <div className="flex justify-between items-center text-xs text-gray-400">
                 <span>
                   {progress.completed.toLocaleString()} / {progress.total.toLocaleString()} emails
-                  {urlColumn && " (with scraping)"}
+                  {urlColumns.length > 0 && " (with scraping)"}
                 </span>
                 <span className="flex items-center gap-3">
                   {rate !== null && (
@@ -496,7 +541,7 @@ export default function Home() {
                 <thead>
                   <tr className="bg-gray-900 border-b border-gray-800">
                     {allColumns
-                      .filter((col) => col !== "scraped_content")
+                      .filter((col) => !col.startsWith("scraped_"))
                       .map((col) => (
                         <th
                           key={col}
@@ -518,7 +563,7 @@ export default function Home() {
                       className="border-b border-gray-800 hover:bg-gray-900/50"
                     >
                       {allColumns
-                        .filter((col) => col !== "scraped_content")
+                        .filter((col) => !col.startsWith("scraped_"))
                         .map((col) => (
                           <td
                             key={col}
