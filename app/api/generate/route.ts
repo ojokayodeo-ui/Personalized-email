@@ -102,13 +102,15 @@ export async function POST(req: NextRequest) {
   const {
     rows,
     prompt,
-    urlColumns = [], // array of column names to scrape
+    urlColumns = [],
     batchSize = 10,
+    outputColumn = "generated_email",
   }: {
     rows: Record<string, string>[];
     prompt: string;
     urlColumns?: string[];
     batchSize?: number;
+    outputColumn?: string;
   } = body;
 
   if (!rows || !prompt) {
@@ -208,7 +210,7 @@ export async function POST(req: NextRequest) {
           for (const [k, v] of Object.entries(row)) {
             if (!k.startsWith("scraped_")) exportRow[k] = String(v ?? "");
           }
-          exportRow.generated_email = email;
+          exportRow[outputColumn] = email;
           results[idx] = exportRow as Record<string, string> & { generated_email: string };
           completed++;
           // Force a progress event for every row so the client never misses a result

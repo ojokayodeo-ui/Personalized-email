@@ -1,7 +1,21 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import Papa from "papaparse";
+
+const STORAGE_KEY = "cold-email-session-v2";
+
+function saveToStorage(data: object) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // QuotaExceededError — try saving without results
+    try {
+      const { results: _r, followUpResults: _f, ...small } = data as Record<string, unknown>;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(small));
+    } catch { /* ignore */ }
+  }
+}
 
 type Row = Record<string, string>;
 
@@ -82,6 +96,27 @@ Requirements:
 - No subject line, no signature`;
 }
 
+function buildFollowUpSamplePrompt(cols: string[]): string {
+  const find = (...patterns: RegExp[]) =>
+    cols.find((c) => patterns.some((p) => p.test(c)));
+  const firstName = find(/first.?name/i, /^first$/i);
+  const company = find(/company.?name.?for.?email/i, /company.?name/i, /\bcompany\b/i);
+  const nameVar = firstName ? `{${firstName}}` : "them";
+  return `Write a short follow-up email to ${nameVar} who has not responded to this previous outreach:
+
+--- Previous Email ---
+{generated_email}
+--- End ---
+
+Instructions:
+- 2–3 sentences only
+- Acknowledge they may be busy
+- Restate the value in one sentence${company ? `\n- Mention {${company}} naturally` : ""}
+- End with an even softer, easier CTA than the original
+- Warmer and more casual tone than the first email
+- No subject line, no signature`;
+}
+
 function clientInterpolate(template: string, row: Row, urlCols: string[]): string {
   return template.replace(/\{([^}]+)\}/g, (match, key) => {
     if (key === "scraped_content") {
@@ -90,6 +125,7 @@ function clientInterpolate(template: string, row: Row, urlCols: string[]): strin
         : "[no URL columns selected for scraping]";
     }
     if (key.startsWith("scraped_")) return `[scraped at generation time]`;
+    if (key === "generated_email") return "[original email from Step 4 generation]";
     return row[key] ?? match;
   });
 }
@@ -110,12 +146,64 @@ export default function Home() {
   const [copied, setCopied] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
 
+  // Follow-up email state
+  const [followUpPrompt, setFollowUpPrompt] = useState("");
+  const [followUpResults, setFollowUpResults] = useState<(Row & { generated_email: string })[]>([]);
+  const [generatingFollowUp, setGeneratingFollowUp] = useState(false);
+  const [followUpProgress, setFollowUpProgress] = useState({ completed: 0, total: 0 });
+  const [followUpRate, setFollowUpRate] = useState<number | null>(null);
+  const [followUpPage, setFollowUpPage] = useState(0);
+  const [showFollowUpPreview, setShowFollowUpPreview] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const pendingResultsRef = useRef<(Row & { generated_email: string })[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startTimeRef = useRef<number>(0);
   const completedRef = useRef(0);
+
+  // Follow-up refs
+  const followUpAbortRef = useRef<AbortController | null>(null);
+  const followUpPendingRef = useRef<(Row & { generated_email: string })[]>([]);
+  const followUpFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const followUpStartRef = useRef<number>(0);
+  const followUpCompletedRef = useRef(0);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── Persistence ──────────────────────────────────────────────────────────
+
+  // Load saved session on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const d = JSON.parse(raw) as Record<string, unknown>;
+      if (Array.isArray(d.columns) && d.columns.length) setColumns(d.columns as string[]);
+      if (Array.isArray(d.rows) && (d.rows as Row[]).length) setRows(d.rows as Row[]);
+      if (typeof d.fileName === "string") setFileName(d.fileName);
+      if (typeof d.prompt === "string") setPrompt(d.prompt);
+      if (Array.isArray(d.urlColumns)) setUrlColumns(d.urlColumns as string[]);
+      if (Array.isArray(d.results) && (d.results as Row[]).length)
+        setResults(d.results as (Row & { generated_email: string })[]);
+      if (typeof d.followUpPrompt === "string") setFollowUpPrompt(d.followUpPrompt);
+      if (Array.isArray(d.followUpResults) && (d.followUpResults as Row[]).length)
+        setFollowUpResults(d.followUpResults as (Row & { generated_email: string })[]);
+    } catch { /* corrupt storage — ignore */ }
+  }, []);
+
+  // Debounced save whenever session data changes
+  useEffect(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveToStorage({
+        columns, rows, fileName, prompt, urlColumns,
+        results: results.filter(Boolean),
+        followUpPrompt,
+        followUpResults: followUpResults.filter(Boolean),
+      });
+    }, 800);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [columns, rows, fileName, prompt, urlColumns, results, followUpPrompt, followUpResults]);
 
   const PREVIEW_PAGE_SIZE = 10;
   const urlLikeColumns = columns.filter((c) =>
@@ -274,6 +362,27 @@ export default function Home() {
     setScrapingInfo(null);
   };
 
+  const clearSession = () => {
+    if (!confirm("Clear everything and start a new session?")) return;
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+    setColumns([]);
+    setRows([]);
+    setFileName("");
+    setPrompt("");
+    setUrlColumns([]);
+    setResults([]);
+    setProgress({ completed: 0, total: 0 });
+    setRate(null);
+    setPreviewPage(0);
+    setFollowUpPrompt("");
+    setFollowUpResults([]);
+    setFollowUpProgress({ completed: 0, total: 0 });
+    setFollowUpRate(null);
+    setFollowUpPage(0);
+    setShowPreview(false);
+    setShowFollowUpPreview(false);
+  };
+
   const downloadCSV = () => {
     const validResults = results.filter(Boolean);
     if (!validResults.length) return;
@@ -283,6 +392,105 @@ export default function Home() {
     const a = document.createElement("a");
     a.href = url;
     a.download = `${fileName.replace(/\.csv$/, "")}_with_emails.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const flushFollowUp = useCallback(() => {
+    setFollowUpResults([...followUpPendingRef.current]);
+    const elapsed = (Date.now() - followUpStartRef.current) / 1000 / 60;
+    if (elapsed > 0.05) setFollowUpRate(Math.round(followUpCompletedRef.current / elapsed));
+  }, []);
+
+  const scheduleFollowUpFlush = useCallback(() => {
+    if (followUpFlushRef.current) return;
+    followUpFlushRef.current = setTimeout(() => {
+      followUpFlushRef.current = null;
+      flushFollowUp();
+    }, 250);
+  }, [flushFollowUp]);
+
+  const handleGenerateFollowUp = async () => {
+    const source = results.filter(Boolean);
+    if (!source.length || !followUpPrompt.trim()) return;
+    setGeneratingFollowUp(true);
+    setFollowUpResults([]);
+    setFollowUpProgress({ completed: 0, total: source.length });
+    setFollowUpRate(null);
+    setFollowUpPage(0);
+    followUpPendingRef.current = new Array(source.length);
+    followUpCompletedRef.current = 0;
+    followUpStartRef.current = Date.now();
+    followUpAbortRef.current = new AbortController();
+
+    try {
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rows: source,
+          prompt: followUpPrompt,
+          urlColumns: [],        // no scraping for follow-ups
+          outputColumn: "follow_up_email",
+          batchSize: 10,
+        }),
+        signal: followUpAbortRef.current.signal,
+      });
+      if (!res.body) throw new Error("No response body");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === "progress") {
+              followUpCompletedRef.current = event.completed;
+              followUpPendingRef.current[event.index] = event.row;
+              setFollowUpProgress({ completed: event.completed, total: source.length });
+              scheduleFollowUpFlush();
+            } else if (event.type === "done") {
+              followUpPendingRef.current = event.results;
+              followUpCompletedRef.current = event.results.length;
+              setFollowUpProgress({ completed: event.results.length, total: source.length });
+              if (followUpFlushRef.current) { clearTimeout(followUpFlushRef.current); followUpFlushRef.current = null; }
+              flushFollowUp();
+            }
+          } catch { /* ignore malformed */ }
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== "AbortError") console.error(err);
+    } finally {
+      setGeneratingFollowUp(false);
+      if (followUpFlushRef.current) { clearTimeout(followUpFlushRef.current); followUpFlushRef.current = null; }
+      flushFollowUp();
+    }
+  };
+
+  const handleStopFollowUp = () => {
+    followUpAbortRef.current?.abort();
+    setGeneratingFollowUp(false);
+  };
+
+  const downloadFollowUpCSV = () => {
+    const valid = followUpResults.filter(Boolean);
+    if (!valid.length) return;
+    const csv = Papa.unparse(valid);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${fileName.replace(/\.csv$/, "")}_with_followups.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -309,13 +517,23 @@ export default function Home() {
       <div className="max-w-5xl mx-auto px-4 py-10 space-y-8">
 
         {/* Header */}
-        <div>
-          <h1 className="text-3xl font-bold text-white">Cold Email Personalizer</h1>
-          <p className="mt-1 text-gray-400 text-sm">
-            Upload a CSV, scrape lead websites automatically, write a prompt using{" "}
-            <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code>{" "}
-            variables, and generate personalized emails at scale — up to 10,000+ rows.
-          </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-white">Cold Email Personalizer</h1>
+            <p className="mt-1 text-gray-400 text-sm">
+              Upload a CSV, scrape lead websites automatically, write a prompt using{" "}
+              <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code>{" "}
+              variables, and generate personalized emails at scale — up to 10,000+ rows.
+            </p>
+          </div>
+          {(rows.length > 0 || results.filter(Boolean).length > 0) && (
+            <button
+              onClick={clearSession}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-red-900 border border-gray-700 hover:border-red-700 text-gray-400 hover:text-red-300 transition-colors"
+            >
+              ✕ Clear session
+            </button>
+          )}
         </div>
 
         {/* Step 1: Upload */}
@@ -672,6 +890,168 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
+          </section>
+        )}
+
+        {/* Step 5: Follow-up Emails */}
+        {results.filter(Boolean).length > 0 && (
+          <section className="space-y-4 border-t border-gray-800 pt-8">
+            <div>
+              <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+                Step 5 — Follow-up Emails (optional)
+              </h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Generate a follow-up sequence for leads who haven{"'"}t responded. Use{" "}
+                <code className="bg-gray-800 px-1 rounded text-blue-400">{"{generated_email}"}</code>{" "}
+                to reference the original email, plus any other column variables.
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-gray-500 uppercase tracking-widest font-semibold">Follow-up Prompt</p>
+                <button
+                  onClick={() => setFollowUpPrompt(buildFollowUpSamplePrompt(columns))}
+                  className="text-xs px-3 py-1 rounded-lg bg-indigo-700 hover:bg-indigo-600 text-white transition-colors"
+                >
+                  ✨ Generate sample follow-up
+                </button>
+              </div>
+              <textarea
+                className="w-full h-44 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500 resize-y font-mono"
+                placeholder={`Example:\n\nWrite a follow-up email to {First Name} who hasn't responded.\n\nOriginal email:\n{generated_email}\n\nKeep it 2-3 sentences. Softer CTA. No subject line or signature.`}
+                value={followUpPrompt}
+                onChange={(e) => setFollowUpPrompt(e.target.value)}
+              />
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <p className="text-xs text-gray-500">
+                  Use <code className="bg-gray-800 px-1 rounded text-blue-400">{"{generated_email}"}</code> to include the original email in your follow-up prompt.
+                </p>
+                {followUpPrompt.trim() && (
+                  <button
+                    onClick={() => setShowFollowUpPreview((v) => !v)}
+                    className="text-xs px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors shrink-0"
+                  >
+                    {showFollowUpPreview ? "Hide preview" : "Preview row 1 →"}
+                  </button>
+                )}
+              </div>
+              {showFollowUpPreview && results.filter(Boolean)[0] && (
+                <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 space-y-2">
+                  <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+                    What Claude receives for row 1:
+                  </p>
+                  <pre className="text-xs text-gray-300 whitespace-pre-wrap font-mono leading-relaxed max-h-52 overflow-y-auto">
+                    {clientInterpolate(followUpPrompt, results.filter(Boolean)[0], [])}
+                  </pre>
+                </div>
+              )}
+            </div>
+
+            {/* Follow-up generate button */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <button
+                onClick={generatingFollowUp ? handleStopFollowUp : handleGenerateFollowUp}
+                disabled={!followUpPrompt.trim()}
+                className={`px-6 py-2.5 rounded-lg font-semibold text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                  generatingFollowUp
+                    ? "bg-red-600 hover:bg-red-700 text-white"
+                    : "bg-purple-600 hover:bg-purple-700 text-white"
+                }`}
+              >
+                {generatingFollowUp
+                  ? "⛔ Stop"
+                  : `↩ Generate Follow-ups (${results.filter(Boolean).length} rows)`}
+              </button>
+              {followUpResults.filter(Boolean).length > 0 && !generatingFollowUp && (
+                <button
+                  onClick={downloadFollowUpCSV}
+                  className="px-6 py-2.5 rounded-lg font-semibold text-sm bg-green-600 hover:bg-green-700 text-white transition-colors"
+                >
+                  ⬇ Download with follow-ups
+                </button>
+              )}
+            </div>
+
+            {/* Follow-up progress */}
+            {(generatingFollowUp || followUpProgress.completed > 0) && (() => {
+              const pct = followUpProgress.total > 0
+                ? Math.round((followUpProgress.completed / followUpProgress.total) * 100) : 0;
+              const etaVal = followUpRate && followUpRate > 0 && followUpProgress.completed < followUpProgress.total
+                ? formatDuration(((followUpProgress.total - followUpProgress.completed) / followUpRate) * 60) : null;
+              return (
+                <div className="space-y-2">
+                  <div className="flex justify-between items-center text-xs text-gray-400">
+                    <span>{followUpProgress.completed.toLocaleString()} / {followUpProgress.total.toLocaleString()} follow-ups</span>
+                    <span className="flex items-center gap-3">
+                      {followUpRate !== null && <span className="text-gray-500">{followUpRate.toLocaleString()} rows/min</span>}
+                      {etaVal && generatingFollowUp && <span className="text-purple-400">~{etaVal} left</span>}
+                      <span>{pct}%</span>
+                    </span>
+                  </div>
+                  <div className="w-full bg-gray-800 rounded-full h-2.5">
+                    <div className="bg-purple-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Follow-up preview table */}
+            {followUpResults.filter(Boolean).length > 0 && (() => {
+              const validFU = followUpResults.filter(Boolean);
+              const fuCols = Object.keys(validFU[0]).filter((c) => !c.startsWith("scraped_"));
+              const fuTotalPages = Math.ceil(validFU.length / PREVIEW_PAGE_SIZE);
+              const fuPageData = validFU.slice(
+                followUpPage * PREVIEW_PAGE_SIZE,
+                (followUpPage + 1) * PREVIEW_PAGE_SIZE
+              );
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+                      Follow-up Preview — {validFU.length.toLocaleString()} rows
+                    </h3>
+                    {fuTotalPages > 1 && (
+                      <div className="flex items-center gap-2 text-sm">
+                        <button onClick={() => setFollowUpPage((p) => Math.max(0, p - 1))} disabled={followUpPage === 0} className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-30">←</button>
+                        <span className="text-gray-400">{followUpPage + 1} / {fuTotalPages}</span>
+                        <button onClick={() => setFollowUpPage((p) => Math.min(fuTotalPages - 1, p + 1))} disabled={followUpPage === fuTotalPages - 1} className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-30">→</button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="overflow-x-auto rounded-xl border border-gray-800">
+                    <table className="min-w-full text-sm">
+                      <thead>
+                        <tr className="bg-gray-900 border-b border-gray-800">
+                          {fuCols.map((col) => (
+                            <th key={col} className={`px-4 py-3 text-left font-semibold text-xs uppercase tracking-wide whitespace-nowrap ${
+                              col === "follow_up_email" ? "text-purple-400 min-w-80" : col === "generated_email" ? "text-blue-400 min-w-64" : "text-gray-400"
+                            }`}>
+                              {col === "follow_up_email" ? "↩ Follow-up Email" : col === "generated_email" ? "✉ Original Email" : col}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {fuPageData.map((row, i) => (
+                          <tr key={i} className="border-b border-gray-800 hover:bg-gray-900/50">
+                            {fuCols.map((col) => (
+                              <td key={col} className={`px-4 py-3 align-top ${
+                                col === "follow_up_email" || col === "generated_email"
+                                  ? "text-gray-200 whitespace-pre-wrap text-xs leading-relaxed"
+                                  : "text-gray-400 text-xs max-w-32 truncate"
+                              }`}>
+                                {row[col] ?? ""}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })()}
           </section>
         )}
 
