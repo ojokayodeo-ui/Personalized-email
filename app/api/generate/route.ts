@@ -6,6 +6,9 @@ export const maxDuration = 300;
 
 const client = new Anthropic();
 
+// Hard cap on how long a single row can take (scrape + Claude)
+const ROW_TIMEOUT_MS = 90_000;
+
 function interpolate(template: string, row: Record<string, string>): string {
   return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
 }
@@ -127,94 +130,96 @@ export async function POST(req: NextRequest) {
 
       const results: (Record<string, string> & { generated_email: string })[] = new Array(rows.length);
       let completed = 0;
-      let lastProgressSent = 0;
-      const PROGRESS_INTERVAL_MS = 500;
 
-      const sendProgress = (index: number, row: Record<string, string> & { generated_email: string }, force = false) => {
-        const now = Date.now();
-        if (force || now - lastProgressSent >= PROGRESS_INTERVAL_MS) {
-          lastProgressSent = now;
-          send({ type: "progress", completed, total: rows.length, row, index });
+      // Process a single row: scrape + generate. Never rejects — always returns a result.
+      const processRow = async (row: Record<string, string>, idx: number): Promise<{ idx: number; email: string; row: Record<string, string> }> => {
+        try {
+          const enrichedRow: Record<string, string> = { ...row };
+
+          if (urlColumns.length > 0) {
+            const scrapedParts: string[] = [];
+            await Promise.all(
+              urlColumns.map(async (col) => {
+                const url = row[col];
+                if (!url) return;
+                send({ type: "scraping", index: idx, col, url });
+                const text = await scrapeUrl(url);
+                enrichedRow[scrapedVarName(col)] = text;
+                if (text) scrapedParts.push(`[${col}]\n${text}`);
+              })
+            );
+            enrichedRow["scraped_content"] = scrapedParts.join("\n\n---\n\n");
+          }
+
+          // Fallback: when scraping returns nothing, populate {scraped_content}
+          // from the row's own CSV data so every email is still personalized
+          if (!enrichedRow["scraped_content"]) {
+            const skipKeys = new Set(urlColumns.map((c) => c.toLowerCase()));
+            const parts = Object.entries(row)
+              .filter(([k, v]) =>
+                v &&
+                !skipKeys.has(k.toLowerCase()) &&
+                !k.toLowerCase().includes("phone") &&
+                !k.toLowerCase().includes("email") &&
+                !k.toLowerCase().includes("id") &&
+                !k.toLowerCase().includes("status")
+              )
+              .map(([k, v]) => `${k}: ${v}`)
+              .join("\n");
+            if (parts) {
+              enrichedRow["scraped_content"] =
+                `[Website unavailable — using lead profile data]\n${parts}`;
+            }
+          }
+
+          const email = await generateEmailWithRetry(prompt, enrichedRow);
+          return { idx, email, row: enrichedRow };
+        } catch (err) {
+          return { idx, email: `Error: ${err instanceof Error ? err.message : String(err)}`, row };
         }
       };
+
+      // Wrap a row promise with a hard timeout so one stuck row never blocks the batch
+      const processRowWithTimeout = (row: Record<string, string>, idx: number) =>
+        Promise.race([
+          processRow(row, idx),
+          new Promise<{ idx: number; email: string; row: Record<string, string> }>((resolve) =>
+            setTimeout(() => resolve({ idx, email: "Error: row timed out after 90s", row }), ROW_TIMEOUT_MS)
+          ),
+        ]);
 
       for (let i = 0; i < rows.length; i += batchSize) {
         const batch = rows.slice(i, i + batchSize);
 
-        const batchPromises = batch.map(async (row, batchIdx) => {
-          const idx = i + batchIdx;
-          try {
-            const enrichedRow: Record<string, string> = { ...row };
+        // Use allSettled so an unexpected rejection never aborts the batch
+        const settled = await Promise.allSettled(
+          batch.map((row, batchIdx) => processRowWithTimeout(row, i + batchIdx))
+        );
 
-            // Scrape each selected URL column in parallel
-            if (urlColumns.length > 0) {
-              const scrapedParts: string[] = [];
+        for (const outcome of settled) {
+          const { idx, email, row } =
+            outcome.status === "fulfilled"
+              ? outcome.value
+              : { idx: -1, email: "Error: unexpected batch failure", row: {} };
 
-              await Promise.all(
-                urlColumns.map(async (col) => {
-                  const url = row[col];
-                  if (!url) return;
-                  send({ type: "scraping", index: idx, col, url });
-                  const text = await scrapeUrl(url);
-                  enrichedRow[scrapedVarName(col)] = text;
-                  if (text) scrapedParts.push(`[${col}]\n${text}`);
-                })
-              );
+          if (idx < 0) continue;
 
-              // Combined variable — all scraped sources joined
-              enrichedRow["scraped_content"] = scrapedParts.join("\n\n---\n\n");
-            }
-
-            // Fallback: if scraping returned nothing, build context from CSV columns
-            // so {scraped_content} always has something useful for personalization
-            if (!enrichedRow["scraped_content"]) {
-              const skipKeys = new Set(urlColumns.map((c) => c.toLowerCase()));
-              const parts = Object.entries(row)
-                .filter(([k, v]) =>
-                  v &&
-                  !skipKeys.has(k.toLowerCase()) &&
-                  !k.toLowerCase().includes("phone") &&
-                  !k.toLowerCase().includes("email") &&
-                  !k.toLowerCase().includes("id") &&
-                  !k.toLowerCase().includes("status")
-                )
-                .map(([k, v]) => `${k}: ${v}`)
-                .join("\n");
-              if (parts) {
-                enrichedRow["scraped_content"] =
-                  `[Website unavailable — using lead profile data]\n${parts}`;
-              }
-            }
-
-            const email = await generateEmailWithRetry(prompt, enrichedRow);
-            return { idx, email, row: enrichedRow };
-          } catch (err) {
-            const errorMsg = err instanceof Error ? err.message : "Unknown error";
-            // Always return something so every row completes
-            return { idx, email: `Error: ${errorMsg}`, row };
-          }
-        });
-
-        const batchResults = await Promise.all(batchPromises);
-
-        for (const { idx, email, row } of batchResults) {
-          // Strip scraped_ columns from exported results to keep CSV clean
-          // but keep generated_email
           const exportRow: Record<string, string> = {};
           for (const [k, v] of Object.entries(row)) {
-            if (!k.startsWith("scraped_")) exportRow[k] = v;
+            if (!k.startsWith("scraped_")) exportRow[k] = String(v ?? "");
           }
           exportRow.generated_email = email;
           results[idx] = exportRow as Record<string, string> & { generated_email: string };
           completed++;
-          sendProgress(idx, results[idx], completed === rows.length);
+          // Force a progress event for every row so the client never misses a result
+          send({ type: "progress", completed, total: rows.length, row: results[idx], index: idx });
         }
       }
 
-      // Fill any gaps (should not happen, but safety net)
+      // Safety net: fill any slots that somehow never received a result
       for (let i = 0; i < rows.length; i++) {
         if (!results[i]) {
-          results[i] = { ...rows[i], generated_email: "Error: did not complete" };
+          results[i] = { ...rows[i], generated_email: "Error: row did not complete" };
         }
       }
 
