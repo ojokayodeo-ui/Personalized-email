@@ -380,12 +380,15 @@ export default function Home() {
                   <div className="flex flex-col gap-2">
                     {urlLikeColumns.map((col) => {
                       const isChecked = urlColumns.includes(col);
+                      const isBlocked = /linkedin|facebook|twitter|instagram/i.test(col);
                       return (
                         <label
                           key={col}
                           className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer border transition-colors ${
-                            isChecked
+                            isChecked && !isBlocked
                               ? "bg-blue-900/40 border-blue-600 text-blue-200"
+                              : isChecked && isBlocked
+                              ? "bg-yellow-900/30 border-yellow-700 text-yellow-200"
                               : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"
                           }`}
                         >
@@ -396,21 +399,28 @@ export default function Home() {
                             className="accent-blue-500 w-4 h-4 shrink-0"
                           />
                           <span className="text-sm font-mono">{col}</span>
-                          {isChecked && (
+                          {isBlocked ? (
+                            <span className="ml-auto text-xs text-yellow-500 shrink-0">⚠ blocks scraping</span>
+                          ) : isChecked ? (
                             <span className="ml-auto text-xs text-indigo-400 font-mono shrink-0">
                               → {"{" + scrapedVarName(col) + "}"}
                             </span>
-                          )}
+                          ) : null}
                         </label>
                       );
                     })}
                   </div>
-                  {urlColumns.length > 0 && (
-                    <p className="text-xs text-green-400">
-                      ✓ Will scrape {urlColumns.length} column{urlColumns.length > 1 ? "s" : ""}. Use{" "}
-                      <span className="font-mono">{"{scraped_content}"}</span> in your prompt for the text.
+                  <div className="space-y-1">
+                    {urlColumns.length > 0 && (
+                      <p className="text-xs text-green-400">
+                        ✓ Will scrape {urlColumns.length} column{urlColumns.length > 1 ? "s" : ""}. Use{" "}
+                        <span className="font-mono">{"{scraped_content}"}</span> in your prompt.
+                      </p>
+                    )}
+                    <p className="text-xs text-gray-500">
+                      If a site blocks scraping, the app automatically falls back to the lead{"'"}s CSV data so every email is still personalized.
                     </p>
-                  )}
+                  </div>
                 </>
               )}
             </div>

@@ -15,30 +15,48 @@ function scrapedVarName(col: string): string {
   return `scraped_${col.replace(/\s+/g, "_")}`;
 }
 
+// Domains that always block scraping (login walls, bot detection, etc.)
+const ALWAYS_BLOCKED = /linkedin\.com|facebook\.com|instagram\.com|twitter\.com|x\.com/i;
+
 async function scrapeUrl(url: string): Promise<string> {
+  if (!url?.trim() || ALWAYS_BLOCKED.test(url)) return "";
   try {
     const normalized = url.startsWith("http") ? url : `https://${url}`;
     const res = await fetch(normalized, {
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(12000),
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
       },
     });
     if (!res.ok) return "";
     const html = await res.text();
     const $ = cheerio.load(html);
-    $("script, style, nav, footer, header, noscript, iframe, svg").remove();
-    const selectors = ["main", "article", '[class*="about"]', '[class*="hero"]', '[class*="content"]', "body"];
+    $("script, style, nav, footer, header, noscript, iframe, svg, form, [class*='cookie'], [class*='banner'], [class*='popup']").remove();
+    const selectors = ["main", "article", '[class*="about"]', '[class*="hero"]', '[class*="content"]', '[class*="home"]', "section", "body"];
     let text = "";
     for (const sel of selectors) {
       const el = $(sel);
       if (el.length) {
         text = el.text().replace(/\s+/g, " ").trim();
-        if (text.length > 200) break;
+        if (text.length > 300) break;
       }
     }
-    return text.slice(0, 1500);
+    // Detect blocked/login pages
+    const lower = text.toLowerCase();
+    if (
+      text.length < 150 ||
+      (lower.includes("sign in") && (lower.includes("password") || lower.includes("email"))) ||
+      lower.includes("enable javascript to continue") ||
+      lower.includes("access denied") ||
+      lower.includes("403 forbidden") ||
+      lower.includes("just a moment") // Cloudflare
+    ) {
+      return "";
+    }
+    return text.slice(0, 2000);
   } catch {
     return "";
   }
@@ -145,6 +163,27 @@ export async function POST(req: NextRequest) {
 
               // Combined variable — all scraped sources joined
               enrichedRow["scraped_content"] = scrapedParts.join("\n\n---\n\n");
+            }
+
+            // Fallback: if scraping returned nothing, build context from CSV columns
+            // so {scraped_content} always has something useful for personalization
+            if (!enrichedRow["scraped_content"]) {
+              const skipKeys = new Set(urlColumns.map((c) => c.toLowerCase()));
+              const parts = Object.entries(row)
+                .filter(([k, v]) =>
+                  v &&
+                  !skipKeys.has(k.toLowerCase()) &&
+                  !k.toLowerCase().includes("phone") &&
+                  !k.toLowerCase().includes("email") &&
+                  !k.toLowerCase().includes("id") &&
+                  !k.toLowerCase().includes("status")
+                )
+                .map(([k, v]) => `${k}: ${v}`)
+                .join("\n");
+              if (parts) {
+                enrichedRow["scraped_content"] =
+                  `[Website unavailable — using lead profile data]\n${parts}`;
+              }
             }
 
             const email = await generateEmailWithRetry(prompt, enrichedRow);
