@@ -38,6 +38,62 @@ function scrapedVarName(col: string): string {
   return `scraped_${col.replace(/\s+/g, "_")}`;
 }
 
+function buildSamplePrompt(cols: string[], urlCols: string[]): string {
+  const find = (...patterns: RegExp[]) =>
+    cols.find((c) => patterns.some((p) => p.test(c)));
+
+  const firstName = find(/first.?name/i, /^first$/i);
+  const lastName = find(/last.?name/i, /^last$/i);
+  const title = find(/\btitle\b/i, /job.?title/i, /\bposition\b/i, /\brole\b/i);
+  const company = find(/company.?name.?for.?email/i, /company.?name/i, /\bcompany\b/i);
+  const industry = find(/\bindustry\b/i);
+  const city = find(/\bcity\b/i);
+  const country = find(/\bcountry\b/i);
+
+  const nameVar = firstName
+    ? `{${firstName}}${lastName ? ` {${lastName}}` : ""}`
+    : "there";
+
+  const profileLines = [
+    firstName && `Name: {${firstName}}${lastName ? ` {${lastName}}` : ""}`,
+    title && `Title: {${title}}`,
+    company && `Company: {${company}}`,
+    industry && `Industry: {${industry}}`,
+    (city || country) &&
+      `Location: ${[city && `{${city}}`, country && `{${country}}`].filter(Boolean).join(", ")}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const scrapeSection =
+    urlCols.length > 0 ? `\nResearch from their website:\n{scraped_content}\n` : "";
+
+  return `Write a short, personalized cold email to ${nameVar}.
+
+Lead profile:
+${profileLines}
+${scrapeSection}
+Requirements:
+- Open with something specific to them — their role, company, industry, or a detail from their website
+- 3–5 sentences maximum, no filler openers like "I hope this finds you well"
+- Naturally reference ${title ? `{${title}}` : "their role"} at ${company ? `{${company}}` : "their company"}
+- End with one clear, low-friction CTA
+- Human and conversational, not salesy
+- No subject line, no signature`;
+}
+
+function clientInterpolate(template: string, row: Row, urlCols: string[]): string {
+  return template.replace(/\{([^}]+)\}/g, (match, key) => {
+    if (key === "scraped_content") {
+      return urlCols.length > 0
+        ? `[scraped website content — fetched at generation time]`
+        : "[no URL columns selected for scraping]";
+    }
+    if (key.startsWith("scraped_")) return `[scraped at generation time]`;
+    return row[key] ?? match;
+  });
+}
+
 export default function Home() {
   const [columns, setColumns] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
@@ -52,6 +108,7 @@ export default function Home() {
   const [results, setResults] = useState<(Row & { generated_email: string })[]>([]);
   const [previewPage, setPreviewPage] = useState(0);
   const [copied, setCopied] = useState<string | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -339,14 +396,13 @@ export default function Home() {
                       {copied === scrapedVarName(col) ? "✓ Copied!" : `{${scrapedVarName(col)}}`}
                     </button>
                   ))}
-                  {urlColumns.length > 1 && (
-                    <button
-                      onClick={() => copyColumn("scraped_content")}
-                      className="px-3 py-1 rounded-full bg-blue-900 hover:bg-blue-600 text-sm text-blue-300 hover:text-white transition-colors font-mono border border-blue-700"
-                    >
-                      {copied === "scraped_content" ? "✓ Copied!" : "{scraped_content}"}
-                    </button>
-                  )}
+                  <button
+                    onClick={() => copyColumn("scraped_content")}
+                    className="px-3 py-1 rounded-full bg-blue-900 hover:bg-blue-600 text-sm text-blue-300 hover:text-white transition-colors font-mono border border-blue-700"
+                    title="All scraped columns combined"
+                  >
+                    {copied === "scraped_content" ? "✓ Copied!" : "{scraped_content}"}
+                  </button>
                 </>
               )}
             </div>
@@ -429,35 +485,53 @@ export default function Home() {
 
         {/* Step 3: Prompt */}
         <section className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
-            {columns.length > 0 ? "Step 3" : "Step 2"} — Write Your Prompt
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-xs font-semibold uppercase tracking-widest text-gray-500">
+              {columns.length > 0 ? "Step 3" : "Step 2"} — Write Your Prompt
+            </h2>
+            {columns.length > 0 && (
+              <button
+                onClick={() => setPrompt(buildSamplePrompt(columns, urlColumns))}
+                className="text-xs px-3 py-1 rounded-lg bg-indigo-700 hover:bg-indigo-600 text-white transition-colors"
+              >
+                ✨ Generate sample prompt
+              </button>
+            )}
+          </div>
           <textarea
-            className="w-full h-52 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
-            placeholder={`Example with web scraping:\n\nHere is info scraped from {First Name}'s company site:\n{scraped_content}\n\nWrite a personalized cold email to {First Name}, {Title} at {Company}. Reference something specific from their site. Under 120 words with a clear CTA.`}
+            className="w-full h-56 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
+            placeholder={`Click "Generate sample prompt" above to get a ready-to-use template, or write your own.\n\nUse {First Name}, {Company Name}, {scraped_content} etc. to inject lead data.\n\nExample:\n\nWrite a short cold email to {First Name} at {Company Name}.\nResearch: {scraped_content}\nKeep it under 100 words. End with a CTA.`}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
           />
-          <p className="text-xs text-gray-500">
-            Use{" "}
-            <code className="bg-gray-800 px-1 rounded text-blue-400">
-              {"{column_name}"}
-            </code>{" "}
-            to inject lead data.
-            {urlColumns.length > 0 && (
-              <>
-                {" "}Use{" "}
-                <code className="bg-gray-800 px-1 rounded text-blue-400">
-                  {"{scraped_content}"}
-                </code>{" "}
-                for all scraped text, or individual{" "}
-                <code className="bg-gray-800 px-1 rounded text-blue-400">
-                  {"{scraped_[ColumnName]}"}
-                </code>{" "}
-                variables.
-              </>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <p className="text-xs text-gray-500">
+              Your prompt <strong className="text-gray-300">must include</strong> variables like{" "}
+              <code className="bg-gray-800 px-1 rounded text-blue-400">{"{First Name}"}</code>,{" "}
+              <code className="bg-gray-800 px-1 rounded text-blue-400">{"{Company Name}"}</code>,{" "}
+              <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_content}"}</code>{" "}
+              for emails to be personalized.
+            </p>
+            {rows.length > 0 && prompt.trim() && (
+              <button
+                onClick={() => setShowPreview((v) => !v)}
+                className="text-xs px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors shrink-0"
+              >
+                {showPreview ? "Hide preview" : "Preview row 1 →"}
+              </button>
             )}
-          </p>
+          </div>
+          {/* Prompt preview for row 1 */}
+          {showPreview && rows[0] && (
+            <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 space-y-2">
+              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+                What Claude receives for row 1 (variables substituted):
+              </p>
+              <pre className="text-xs text-gray-300 whitespace-pre-wrap font-mono leading-relaxed max-h-60 overflow-y-auto">
+                {clientInterpolate(prompt, rows[0], urlColumns)}
+              </pre>
+            </div>
+          )}
         </section>
 
         {/* Step 4: Generate */}
