@@ -360,51 +360,58 @@ export default function Home() {
               Step 2 — Web Scraping (optional)
             </h2>
             <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 space-y-3">
-              <p className="text-sm text-gray-400">
-                Select one or more columns containing URLs. Each column is scraped and
-                available as{" "}
-                <code className="bg-gray-800 px-1 rounded text-blue-400">
-                  {"{scraped_[ColumnName]}"}
-                </code>
-                {". "}
-                When multiple columns are selected, all scraped text is also combined into{" "}
-                <code className="bg-gray-800 px-1 rounded text-blue-400">
-                  {"{scraped_content}"}
-                </code>
-                .
-              </p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                {columns.map((col) => {
-                  const isChecked = urlColumns.includes(col);
-                  const isUrlLike = urlLikeColumns.includes(col);
-                  return (
-                    <label
-                      key={col}
-                      className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer border transition-colors ${
-                        isChecked
-                          ? "bg-blue-900/40 border-blue-600 text-blue-200"
-                          : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        onChange={() => toggleUrlColumn(col)}
-                        className="accent-blue-500 w-4 h-4 shrink-0"
-                      />
-                      <span className="text-sm font-mono truncate">{col}</span>
-                      {isUrlLike && (
-                        <span className="ml-auto text-xs text-blue-400 shrink-0">🔗 URL</span>
-                      )}
-                    </label>
-                  );
-                })}
-              </div>
-              {urlColumns.length > 0 && (
-                <p className="text-xs text-green-400">
-                  ✓ Scraping {urlColumns.length} column{urlColumns.length > 1 ? "s" : ""}:{" "}
-                  {urlColumns.join(", ")}
+              {urlLikeColumns.length === 0 ? (
+                <p className="text-sm text-gray-500 italic">
+                  No URL columns detected in this CSV. Name a column with "url", "website",
+                  "linkedin", etc. to enable scraping.
                 </p>
+              ) : (
+                <>
+                  <p className="text-sm text-gray-400">
+                    Check the URL columns to scrape. The page text is available in your prompt as{" "}
+                    <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_content}"}</code>
+                    {" "}(all combined) or per-column as{" "}
+                    <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_[ColumnName]}"}</code>.
+                    {" "}Note: <code className="bg-gray-800 px-1 rounded text-yellow-400">{"{Website}"}</code>{" "}
+                    only inserts the raw URL — use{" "}
+                    <code className="bg-gray-800 px-1 rounded text-blue-400">{"{scraped_Website}"}</code>{" "}
+                    for the actual page content.
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    {urlLikeColumns.map((col) => {
+                      const isChecked = urlColumns.includes(col);
+                      return (
+                        <label
+                          key={col}
+                          className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer border transition-colors ${
+                            isChecked
+                              ? "bg-blue-900/40 border-blue-600 text-blue-200"
+                              : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => toggleUrlColumn(col)}
+                            className="accent-blue-500 w-4 h-4 shrink-0"
+                          />
+                          <span className="text-sm font-mono">{col}</span>
+                          {isChecked && (
+                            <span className="ml-auto text-xs text-indigo-400 font-mono shrink-0">
+                              → {"{" + scrapedVarName(col) + "}"}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {urlColumns.length > 0 && (
+                    <p className="text-xs text-green-400">
+                      ✓ Will scrape {urlColumns.length} column{urlColumns.length > 1 ? "s" : ""}. Use{" "}
+                      <span className="font-mono">{"{scraped_content}"}</span> in your prompt for the text.
+                    </p>
+                  )}
+                </>
               )}
             </div>
           </section>
