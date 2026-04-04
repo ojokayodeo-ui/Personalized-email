@@ -19,10 +19,69 @@ function scrapedVarName(col: string): string {
 }
 
 // Domains that always block scraping (login walls, bot detection, etc.)
-const ALWAYS_BLOCKED = /linkedin\.com|facebook\.com|instagram\.com|twitter\.com|x\.com/i;
+// LinkedIn is handled separately via Proxycurl API
+const ALWAYS_BLOCKED = /facebook\.com|instagram\.com|twitter\.com|x\.com/i;
+
+// ── Proxycurl LinkedIn scraping ───────────────────────────────────────────
+
+async function scrapeLinkedIn(url: string): Promise<string> {
+  const apiKey = process.env.PROXYCURL_API_KEY;
+  if (!apiKey) return "";
+
+  try {
+    const isCompany = /linkedin\.com\/company\//i.test(url);
+    const endpoint = isCompany
+      ? "https://nubela.co/proxycurl/api/linkedin/company"
+      : "https://nubela.co/proxycurl/api/v2/linkedin";
+
+    const res = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) return "";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d: any = await res.json();
+    const parts: string[] = [];
+
+    if (isCompany) {
+      if (d.name)        parts.push(`Company: ${d.name}`);
+      if (d.description) parts.push(`Description: ${String(d.description).slice(0, 600)}`);
+      if (d.industry)    parts.push(`Industry: ${d.industry}`);
+      if (d.company_size_on_linkedin) parts.push(`Size: ${d.company_size_on_linkedin} employees`);
+      if (d.hq)          parts.push(`HQ: ${[d.hq.city, d.hq.country].filter(Boolean).join(", ")}`);
+      if (d.specialities?.length) parts.push(`Specialties: ${(d.specialities as string[]).slice(0, 8).join(", ")}`);
+      if (d.tagline)     parts.push(`Tagline: ${d.tagline}`);
+    } else {
+      if (d.full_name)   parts.push(`Name: ${d.full_name}`);
+      if (d.headline)    parts.push(`Headline: ${d.headline}`);
+      if (d.summary)     parts.push(`Summary: ${String(d.summary).slice(0, 500)}`);
+      if (d.city || d.country_full_name)
+        parts.push(`Location: ${[d.city, d.country_full_name].filter(Boolean).join(", ")}`);
+      const exp = d.experiences?.[0];
+      if (exp) {
+        parts.push(`Current Role: ${exp.title} at ${exp.company}`);
+        if (exp.description) parts.push(`Role Description: ${String(exp.description).slice(0, 300)}`);
+      }
+      if (d.skills?.length) parts.push(`Skills: ${(d.skills as string[]).slice(0, 10).join(", ")}`);
+      if (d.education?.length) {
+        const edu = d.education[0];
+        parts.push(`Education: ${edu.school}${edu.field_of_study ? ` — ${edu.field_of_study}` : ""}`);
+      }
+    }
+
+    return parts.join("\n");
+  } catch {
+    return "";
+  }
+}
 
 async function scrapeUrl(url: string): Promise<string> {
-  if (!url?.trim() || ALWAYS_BLOCKED.test(url)) return "";
+  if (!url?.trim()) return "";
+  // LinkedIn → Proxycurl API
+  if (/linkedin\.com/i.test(url)) return scrapeLinkedIn(url);
+  // Other social networks remain blocked
+  if (ALWAYS_BLOCKED.test(url)) return "";
   try {
     const normalized = url.startsWith("http") ? url : `https://${url}`;
     const res = await fetch(normalized, {
