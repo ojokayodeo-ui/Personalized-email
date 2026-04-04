@@ -7,7 +7,7 @@ export const maxDuration = 300;
 const client = new Anthropic();
 
 // Hard cap on how long a single row can take (scrape + Claude)
-const ROW_TIMEOUT_MS = 90_000;
+const ROW_TIMEOUT_MS = 25_000;
 
 function interpolate(template: string, row: Record<string, string>): string {
   return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
@@ -36,7 +36,7 @@ async function scrapeLinkedIn(url: string): Promise<string> {
 
     const res = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!res.ok) return "";
@@ -85,7 +85,7 @@ async function scrapeUrl(url: string): Promise<string> {
   try {
     const normalized = url.startsWith("http") ? url : `https://${url}`;
     const res = await fetch(normalized, {
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(8000),
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

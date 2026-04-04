@@ -273,6 +273,36 @@ export default function Home() {
     }, 250);
   }, [flushResults]);
 
+  // Read one SSE stream and call handlers for each event
+  const readStream = async (
+    body: ReadableStream<Uint8Array>,
+    onScraping: (col: string, url: string) => void,
+    onProgress: (localIndex: number, row: Row & { generated_email: string }) => void,
+    onDone: (results: (Row & { generated_email: string })[]) => void,
+  ) => {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const event: SSEEvent = JSON.parse(line.slice(6));
+          if (event.type === "scraping") onScraping(event.col, event.url);
+          else if (event.type === "progress") onProgress(event.index, event.row);
+          else if (event.type === "done") onDone(event.results);
+        } catch { /* skip malformed */ }
+      }
+    }
+  };
+
+  const CHUNK_SIZE = 20; // rows per request — keeps each request under ~20-25s
+
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
     setGenerating(true);
@@ -284,74 +314,49 @@ export default function Home() {
     pendingResultsRef.current = new Array(rows.length);
     completedRef.current = 0;
     startTimeRef.current = Date.now();
-
     abortRef.current = new AbortController();
 
     try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rows,
-          prompt,
-          urlColumns,
-          batchSize: 10,
-        }),
-        signal: abortRef.current.signal,
-      });
+      // Send rows in chunks so no single request can be killed by a platform timeout
+      for (let chunkStart = 0; chunkStart < rows.length; chunkStart += CHUNK_SIZE) {
+        if (abortRef.current.signal.aborted) break;
 
-      if (!res.body) throw new Error("No response body");
+        const chunk = rows.slice(chunkStart, chunkStart + CHUNK_SIZE);
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+        const res = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rows: chunk, prompt, urlColumns, batchSize: 5 }),
+          signal: abortRef.current.signal,
+        });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+        if (!res.body) continue;
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const event: SSEEvent = JSON.parse(line.slice(6));
-            if (event.type === "scraping") {
-              setScrapingInfo({ col: event.col, url: event.url });
-            } else if (event.type === "progress") {
-              setScrapingInfo(null);
-              completedRef.current = event.completed;
-              pendingResultsRef.current[event.index] = event.row;
-              setProgress({ completed: event.completed, total: event.total });
-              scheduleFlush();
-            } else if (event.type === "done") {
-              setScrapingInfo(null);
-              pendingResultsRef.current = event.results;
-              completedRef.current = event.results.length;
-              setProgress({ completed: event.results.length, total: event.results.length });
-              if (flushTimerRef.current) {
-                clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-              }
-              flushResults();
-            }
-          } catch {
-            // skip malformed events
-          }
-        }
+        await readStream(
+          res.body,
+          (col, url) => setScrapingInfo({ col, url }),
+          (localIndex, row) => {
+            const globalIndex = chunkStart + localIndex;
+            setScrapingInfo(null);
+            pendingResultsRef.current[globalIndex] = row;
+            completedRef.current++;
+            setProgress({ completed: completedRef.current, total: rows.length });
+            scheduleFlush();
+          },
+          (chunkResults) => {
+            // Merge chunk's final results into the global array
+            chunkResults.forEach((row, localIdx) => {
+              if (row) pendingResultsRef.current[chunkStart + localIdx] = row;
+            });
+          },
+        );
       }
     } catch (err) {
-      if (err instanceof Error && err.name !== "AbortError") {
-        console.error(err);
-      }
+      if (err instanceof Error && err.name !== "AbortError") console.error(err);
     } finally {
       setGenerating(false);
       setScrapingInfo(null);
-      if (flushTimerRef.current) {
-        clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
-      }
+      if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
       flushResults();
     }
   };
@@ -424,49 +429,39 @@ export default function Home() {
     followUpAbortRef.current = new AbortController();
 
     try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rows: source,
-          prompt: followUpPrompt,
-          urlColumns: [],        // no scraping for follow-ups
-          outputColumn: "follow_up_email",
-          batchSize: 10,
-        }),
-        signal: followUpAbortRef.current.signal,
-      });
-      if (!res.body) throw new Error("No response body");
+      for (let chunkStart = 0; chunkStart < source.length; chunkStart += CHUNK_SIZE) {
+        if (followUpAbortRef.current.signal.aborted) break;
+        const chunk = source.slice(chunkStart, chunkStart + CHUNK_SIZE);
+        const res = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rows: chunk,
+            prompt: followUpPrompt,
+            urlColumns: [],
+            outputColumn: "follow_up_email",
+            batchSize: 5,
+          }),
+          signal: followUpAbortRef.current.signal,
+        });
+        if (!res.body) continue;
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const event = JSON.parse(line.slice(6));
-            if (event.type === "progress") {
-              followUpCompletedRef.current = event.completed;
-              followUpPendingRef.current[event.index] = event.row;
-              setFollowUpProgress({ completed: event.completed, total: source.length });
-              scheduleFollowUpFlush();
-            } else if (event.type === "done") {
-              followUpPendingRef.current = event.results;
-              followUpCompletedRef.current = event.results.length;
-              setFollowUpProgress({ completed: event.results.length, total: source.length });
-              if (followUpFlushRef.current) { clearTimeout(followUpFlushRef.current); followUpFlushRef.current = null; }
-              flushFollowUp();
-            }
-          } catch { /* ignore malformed */ }
-        }
+        await readStream(
+          res.body,
+          () => {},
+          (localIndex, row) => {
+            const globalIndex = chunkStart + localIndex;
+            followUpPendingRef.current[globalIndex] = row;
+            followUpCompletedRef.current++;
+            setFollowUpProgress({ completed: followUpCompletedRef.current, total: source.length });
+            scheduleFollowUpFlush();
+          },
+          (chunkResults) => {
+            chunkResults.forEach((row, localIdx) => {
+              if (row) followUpPendingRef.current[chunkStart + localIdx] = row;
+            });
+          },
+        );
       }
     } catch (err) {
       if (err instanceof Error && err.name !== "AbortError") console.error(err);
