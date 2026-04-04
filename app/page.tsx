@@ -145,6 +145,7 @@ export default function Home() {
   const [previewPage, setPreviewPage] = useState(0);
   const [copied, setCopied] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  const [chunkInfo, setChunkInfo] = useState<{ current: number; total: number } | null>(null);
 
   // Follow-up email state
   const [followUpPrompt, setFollowUpPrompt] = useState("");
@@ -301,12 +302,13 @@ export default function Home() {
     }
   };
 
-  const CHUNK_SIZE = 20; // rows per request — keeps each request under ~20-25s
+  const CHUNK_SIZE = 10; // rows per request — keeps each request well under platform timeouts
 
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
     setGenerating(true);
     setScrapingInfo(null);
+    setChunkInfo(null);
     setResults([]);
     setProgress({ completed: 0, total: rows.length });
     setRate(null);
@@ -315,11 +317,13 @@ export default function Home() {
     completedRef.current = 0;
     startTimeRef.current = Date.now();
     abortRef.current = new AbortController();
+    const totalChunks = Math.ceil(rows.length / CHUNK_SIZE);
 
     try {
       // Send rows in chunks so no single request can be killed by a platform timeout
       for (let chunkStart = 0; chunkStart < rows.length; chunkStart += CHUNK_SIZE) {
         if (abortRef.current.signal.aborted) break;
+        setChunkInfo({ current: Math.floor(chunkStart / CHUNK_SIZE) + 1, total: totalChunks });
 
         const chunk = rows.slice(chunkStart, chunkStart + CHUNK_SIZE);
 
@@ -356,6 +360,7 @@ export default function Home() {
     } finally {
       setGenerating(false);
       setScrapingInfo(null);
+      setChunkInfo(null);
       if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
       flushResults();
     }
@@ -365,6 +370,7 @@ export default function Home() {
     abortRef.current?.abort();
     setGenerating(false);
     setScrapingInfo(null);
+    setChunkInfo(null);
   };
 
   const clearSession = () => {
@@ -780,14 +786,21 @@ export default function Home() {
             )}
           </div>
 
-          {/* Scraping indicator */}
-          {generating && scrapingInfo && (
-            <div className="flex items-center gap-2 text-xs text-yellow-400">
-              <span className="animate-pulse">🔍</span>
-              <span className="truncate max-w-md">
-                Scraping <span className="font-semibold">{scrapingInfo.col}</span>:{" "}
-                <span className="font-mono">{scrapingInfo.url}</span>...
-              </span>
+          {/* Chunk + scraping indicator */}
+          {generating && (
+            <div className="flex items-center gap-3 flex-wrap text-xs">
+              {chunkInfo && (
+                <span className="text-gray-500">
+                  Batch {chunkInfo.current} / {chunkInfo.total}
+                </span>
+              )}
+              {scrapingInfo && (
+                <span className="flex items-center gap-1 text-yellow-400 truncate max-w-sm">
+                  <span className="animate-pulse">🔍</span>
+                  Scraping <span className="font-semibold">{scrapingInfo.col}</span>:{" "}
+                  <span className="font-mono truncate">{scrapingInfo.url}</span>
+                </span>
+              )}
             </div>
           )}
 

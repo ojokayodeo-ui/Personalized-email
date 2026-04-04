@@ -78,7 +78,7 @@ async function scrapeLinkedIn(url: string): Promise<string> {
 
 // ── Apify social media scraping ──────────────────────────────────────────
 
-async function runApifyActor(actorId: string, input: object, timeoutSecs = 30): Promise<unknown[]> {
+async function runApifyActor(actorId: string, input: object, timeoutSecs = 8): Promise<unknown[]> {
   const apiKey = process.env.APIFY_API_KEY;
   if (!apiKey) return [];
   try {
@@ -88,7 +88,7 @@ async function runApifyActor(actorId: string, input: object, timeoutSecs = 30): 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(input),
-        signal: AbortSignal.timeout((timeoutSecs + 5) * 1000),
+        signal: AbortSignal.timeout((timeoutSecs + 3) * 1000),
       }
     );
     if (!res.ok) return [];
@@ -109,7 +109,7 @@ async function scrapeTwitter(url: string): Promise<string> {
     startUrls: [`https://twitter.com/${username}`],
     maxTweets: 5,
     sort: "Latest",
-  }, 25);
+  }, 8);
 
   if (!items.length) return "";
   const parts: string[] = [];
@@ -135,7 +135,7 @@ async function scrapeInstagram(url: string): Promise<string> {
 
   const items = await runApifyActor("apify~instagram-profile-scraper", {
     usernames: [username],
-  }, 25);
+  }, 8);
 
   if (!items.length) return "";
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
