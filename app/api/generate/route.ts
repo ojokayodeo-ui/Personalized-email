@@ -19,8 +19,8 @@ function scrapedVarName(col: string): string {
 }
 
 // Domains that always block scraping (login walls, bot detection, etc.)
-// LinkedIn is handled separately via Proxycurl API
-const ALWAYS_BLOCKED = /facebook\.com|instagram\.com|twitter\.com|x\.com/i;
+// LinkedIn → Proxycurl, Twitter/Instagram → Apify
+const ALWAYS_BLOCKED = /facebook\.com/i;
 
 // ── Proxycurl LinkedIn scraping ───────────────────────────────────────────
 
@@ -76,11 +76,89 @@ async function scrapeLinkedIn(url: string): Promise<string> {
   }
 }
 
+// ── Apify social media scraping ──────────────────────────────────────────
+
+async function runApifyActor(actorId: string, input: object, timeoutSecs = 30): Promise<unknown[]> {
+  const apiKey = process.env.APIFY_API_KEY;
+  if (!apiKey) return [];
+  try {
+    const res = await fetch(
+      `https://api.apify.com/v2/acts/${actorId}/run-sync-get-dataset-items?token=${apiKey}&timeout=${timeoutSecs}&memory=256`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout((timeoutSecs + 5) * 1000),
+      }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function scrapeTwitter(url: string): Promise<string> {
+  // Extract username from URL
+  const match = url.match(/(?:twitter|x)\.com\/([A-Za-z0-9_]{1,50})(?:[/?#]|$)/i);
+  const username = match?.[1];
+  if (!username || /^(home|intent|search|explore|notifications|messages|i)$/i.test(username)) return "";
+
+  const items = await runApifyActor("apidojo~tweet-scraper", {
+    startUrls: [`https://twitter.com/${username}`],
+    maxTweets: 5,
+    sort: "Latest",
+  }, 25);
+
+  if (!items.length) return "";
+  const parts: string[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const first = items[0] as any;
+  const author = first?.author ?? first?.user;
+  if (author?.name)        parts.push(`Twitter: @${author.userName ?? username} (${author.name})`);
+  if (author?.description) parts.push(`Bio: ${author.description}`);
+  if (author?.followers)   parts.push(`Followers: ${Number(author.followers).toLocaleString()}`);
+  const tweets = items
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((t: any) => t.text ?? t.full_text)
+    .filter(Boolean)
+    .slice(0, 3) as string[];
+  if (tweets.length) parts.push(`Recent tweets:\n${tweets.map((t) => `- ${t.slice(0, 200)}`).join("\n")}`);
+  return parts.join("\n");
+}
+
+async function scrapeInstagram(url: string): Promise<string> {
+  const match = url.match(/instagram\.com\/([A-Za-z0-9_.]{1,30})(?:[/?#]|$)/i);
+  const username = match?.[1];
+  if (!username || /^(p|reel|explore|stories)$/i.test(username)) return "";
+
+  const items = await runApifyActor("apify~instagram-profile-scraper", {
+    usernames: [username],
+  }, 25);
+
+  if (!items.length) return "";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const profile = items[0] as any;
+  const parts: string[] = [];
+  if (profile?.fullName)  parts.push(`Instagram: @${profile.username ?? username} (${profile.fullName})`);
+  if (profile?.biography) parts.push(`Bio: ${profile.biography}`);
+  if (profile?.followersCount) parts.push(`Followers: ${Number(profile.followersCount).toLocaleString()}`);
+  if (profile?.postsCount)     parts.push(`Posts: ${profile.postsCount}`);
+  return parts.join("\n");
+}
+
+// ── Main scrape dispatcher ────────────────────────────────────────────────
+
 async function scrapeUrl(url: string): Promise<string> {
   if (!url?.trim()) return "";
   // LinkedIn → Proxycurl API
   if (/linkedin\.com/i.test(url)) return scrapeLinkedIn(url);
-  // Other social networks remain blocked
+  // Twitter/X → Apify
+  if (/twitter\.com|x\.com/i.test(url)) return scrapeTwitter(url);
+  // Instagram → Apify
+  if (/instagram\.com/i.test(url)) return scrapeInstagram(url);
+  // Facebook — still blocked (no reliable scraping)
   if (ALWAYS_BLOCKED.test(url)) return "";
   try {
     const normalized = url.startsWith("http") ? url : `https://${url}`;

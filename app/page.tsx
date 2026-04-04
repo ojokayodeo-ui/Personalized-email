@@ -649,8 +649,9 @@ export default function Home() {
                   <div className="flex flex-col gap-2">
                     {urlLikeColumns.map((col) => {
                       const isChecked = urlColumns.includes(col);
-                      const isBlocked = /facebook|twitter|instagram/i.test(col);
+                      const isBlocked = /facebook/i.test(col);
                       const isLinkedIn = /linkedin/i.test(col);
+                      const isApify = /twitter|instagram/i.test(col);
                       return (
                         <label
                           key={col}
@@ -671,10 +672,10 @@ export default function Home() {
                           <span className="text-sm font-mono">{col}</span>
                           {isBlocked ? (
                             <span className="ml-auto text-xs text-yellow-500 shrink-0">⚠ blocks scraping</span>
-                          ) : isLinkedIn && isChecked ? (
-                            <span className="ml-auto text-xs text-blue-400 shrink-0">via Proxycurl API</span>
                           ) : isLinkedIn ? (
-                            <span className="ml-auto text-xs text-gray-500 shrink-0">Proxycurl API</span>
+                            <span className="ml-auto text-xs text-blue-400 shrink-0">{isChecked ? "✓ " : ""}Proxycurl API</span>
+                          ) : isApify ? (
+                            <span className="ml-auto text-xs text-green-400 shrink-0">{isChecked ? "✓ " : ""}Apify API</span>
                           ) : isChecked ? (
                             <span className="ml-auto text-xs text-indigo-400 font-mono shrink-0">
                               → {"{" + scrapedVarName(col) + "}"}
