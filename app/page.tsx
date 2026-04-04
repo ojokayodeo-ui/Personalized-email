@@ -526,14 +526,22 @@ export default function Home() {
               variables, and generate personalized emails at scale — up to 10,000+ rows.
             </p>
           </div>
-          {(rows.length > 0 || results.filter(Boolean).length > 0) && (
-            <button
-              onClick={clearSession}
-              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-red-900 border border-gray-700 hover:border-red-700 text-gray-400 hover:text-red-300 transition-colors"
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href="/prompts"
+              className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium transition-colors"
             >
-              ✕ Clear session
-            </button>
-          )}
+              ✨ Prompt Library
+            </a>
+            {(rows.length > 0 || results.filter(Boolean).length > 0) && (
+              <button
+                onClick={clearSession}
+                className="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-red-900 border border-gray-700 hover:border-red-700 text-gray-400 hover:text-red-300 transition-colors"
+              >
+                ✕ Clear session
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Step 1: Upload */}
