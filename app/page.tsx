@@ -303,57 +303,99 @@ export default function Home() {
   };
 
   const CHUNK_SIZE = 10; // rows per request — keeps each request well under platform timeouts
+  const CHUNK_RETRIES = 3; // retry each chunk up to 3 times on network failure
 
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
+
+    // ── Resume detection ────────────────────────────────────────────────────
+    const existing = results.filter(Boolean);
+    const hasPartial = existing.length > 0 && existing.length < rows.length;
+    let resuming = false;
+    if (hasPartial) {
+      resuming = confirm(
+        `You have ${existing.length.toLocaleString()} / ${rows.length.toLocaleString()} rows already done.\n\nOK = resume from row ${(existing.length + 1).toLocaleString()}\nCancel = start over from row 1`
+      );
+    }
+
     setGenerating(true);
     setScrapingInfo(null);
     setChunkInfo(null);
-    setResults([]);
-    setProgress({ completed: 0, total: rows.length });
     setRate(null);
     setPreviewPage(0);
-    pendingResultsRef.current = new Array(rows.length);
-    completedRef.current = 0;
+
+    if (resuming) {
+      // Keep existing results; pending ref starts from saved state
+      pendingResultsRef.current = [...results];
+      completedRef.current = existing.length;
+      setProgress({ completed: existing.length, total: rows.length });
+    } else {
+      setResults([]);
+      pendingResultsRef.current = new Array(rows.length);
+      completedRef.current = 0;
+      setProgress({ completed: 0, total: rows.length });
+    }
+
     startTimeRef.current = Date.now();
     abortRef.current = new AbortController();
-    const totalChunks = Math.ceil(rows.length / CHUNK_SIZE);
+
+    // Build list of rows that still need processing (skip completed when resuming)
+    const todo = rows
+      .map((row, globalIndex) => ({ row, globalIndex }))
+      .filter(({ globalIndex }) => !pendingResultsRef.current[globalIndex]);
+
+    const totalChunks = Math.ceil(todo.length / CHUNK_SIZE);
 
     try {
-      // Send rows in chunks so no single request can be killed by a platform timeout
-      for (let chunkStart = 0; chunkStart < rows.length; chunkStart += CHUNK_SIZE) {
+      for (let c = 0; c < todo.length; c += CHUNK_SIZE) {
         if (abortRef.current.signal.aborted) break;
-        setChunkInfo({ current: Math.floor(chunkStart / CHUNK_SIZE) + 1, total: totalChunks });
 
-        const chunk = rows.slice(chunkStart, chunkStart + CHUNK_SIZE);
+        const chunkItems = todo.slice(c, c + CHUNK_SIZE);
+        const chunkRows = chunkItems.map((x) => x.row);
+        const globalIndices = chunkItems.map((x) => x.globalIndex);
 
-        const res = await fetch("/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ rows: chunk, prompt, urlColumns, batchSize: 5 }),
-          signal: abortRef.current.signal,
-        });
+        setChunkInfo({ current: Math.floor(c / CHUNK_SIZE) + 1, total: totalChunks });
 
-        if (!res.body) continue;
-
-        await readStream(
-          res.body,
-          (col, url) => setScrapingInfo({ col, url }),
-          (localIndex, row) => {
-            const globalIndex = chunkStart + localIndex;
-            setScrapingInfo(null);
-            pendingResultsRef.current[globalIndex] = row;
-            completedRef.current++;
-            setProgress({ completed: completedRef.current, total: rows.length });
-            scheduleFlush();
-          },
-          (chunkResults) => {
-            // Merge chunk's final results into the global array
-            chunkResults.forEach((row, localIdx) => {
-              if (row) pendingResultsRef.current[chunkStart + localIdx] = row;
+        // ── Per-chunk retry loop ───────────────────────────────────────────
+        let chunkDone = false;
+        for (let attempt = 0; attempt < CHUNK_RETRIES && !chunkDone; attempt++) {
+          if (attempt > 0) {
+            // Brief back-off before retry
+            await new Promise((r) => setTimeout(r, 1500 * attempt));
+          }
+          try {
+            const res = await fetch("/api/generate", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: 5 }),
+              signal: abortRef.current.signal,
             });
-          },
-        );
+            if (!res.body) continue;
+
+            await readStream(
+              res.body,
+              (col, url) => setScrapingInfo({ col, url }),
+              (localIndex, row) => {
+                const globalIndex = globalIndices[localIndex];
+                setScrapingInfo(null);
+                pendingResultsRef.current[globalIndex] = row;
+                completedRef.current++;
+                setProgress({ completed: completedRef.current, total: rows.length });
+                scheduleFlush();
+              },
+              (chunkResults) => {
+                chunkResults.forEach((row, localIdx) => {
+                  if (row) pendingResultsRef.current[globalIndices[localIdx]] = row;
+                });
+                chunkDone = true;
+              },
+            );
+            chunkDone = true;
+          } catch (err) {
+            if (err instanceof Error && err.name === "AbortError") throw err;
+            console.warn(`Chunk ${c} attempt ${attempt + 1} failed:`, err);
+          }
+        }
       }
     } catch (err) {
       if (err instanceof Error && err.name !== "AbortError") console.error(err);
@@ -774,7 +816,11 @@ export default function Home() {
                   : "bg-blue-600 hover:bg-blue-700 text-white"
               }`}
             >
-              {generating ? "⛔ Stop Generation" : "⚡ Generate Emails"}
+              {generating
+                ? "⛔ Stop Generation"
+                : validResults.length > 0 && validResults.length < rows.length
+                ? `▶ Resume (${validResults.length.toLocaleString()} / ${rows.length.toLocaleString()} done)`
+                : "⚡ Generate Emails"}
             </button>
             {validResults.length > 0 && !generating && (
               <button
