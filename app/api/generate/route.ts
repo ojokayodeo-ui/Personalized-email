@@ -40,10 +40,17 @@ async function scrapeLinkedIn(url: string): Promise<string> {
       signal: AbortSignal.timeout(10000),
     });
 
-    if (!res.ok) return "";
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return `[LinkedIn API error ${res.status}: ${errText.slice(0, 200)}]`;
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const d: any = await res.json();
     const parts: string[] = [];
+
+    // Helper: EnrichLayer skills can be strings OR objects with a "name" key
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const skillName = (s: any): string => (typeof s === "string" ? s : s?.name ?? "");
 
     if (isCompany) {
       if (d.name)        parts.push(`Company: ${d.name}`);
@@ -56,24 +63,30 @@ async function scrapeLinkedIn(url: string): Promise<string> {
     } else {
       if (d.full_name)   parts.push(`Name: ${d.full_name}`);
       if (d.headline)    parts.push(`Headline: ${d.headline}`);
+      if (d.occupation)  parts.push(`Occupation: ${d.occupation}`);
       if (d.summary)     parts.push(`Summary: ${String(d.summary).slice(0, 500)}`);
-      if (d.city || d.country_full_name)
-        parts.push(`Location: ${[d.city, d.country_full_name].filter(Boolean).join(", ")}`);
+      const location = [d.city, d.state, d.country_full_name].filter(Boolean).join(", ");
+      if (location)      parts.push(`Location: ${location}`);
       const exp = d.experiences?.[0];
       if (exp) {
-        parts.push(`Current Role: ${exp.title} at ${exp.company}`);
+        const company = exp.company ?? exp.company_name ?? "";
+        parts.push(`Current Role: ${exp.title}${company ? ` at ${company}` : ""}`);
         if (exp.description) parts.push(`Role Description: ${String(exp.description).slice(0, 300)}`);
       }
-      if (d.skills?.length) parts.push(`Skills: ${(d.skills as string[]).slice(0, 10).join(", ")}`);
+      if (d.skills?.length) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const skillList = (d.skills as any[]).slice(0, 10).map(skillName).filter(Boolean);
+        if (skillList.length) parts.push(`Skills: ${skillList.join(", ")}`);
+      }
       if (d.education?.length) {
         const edu = d.education[0];
-        parts.push(`Education: ${edu.school}${edu.field_of_study ? ` — ${edu.field_of_study}` : ""}`);
+        parts.push(`Education: ${edu.school ?? edu.school_name ?? ""}${edu.field_of_study ? ` — ${edu.field_of_study}` : ""}`);
       }
     }
 
-    return parts.join("\n");
-  } catch {
-    return "";
+    return parts.length ? parts.join("\n") : "[LinkedIn profile returned no data]";
+  } catch (err) {
+    return `[LinkedIn scrape error: ${err instanceof Error ? err.message : String(err)}]`;
   }
 }
 
