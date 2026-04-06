@@ -40,7 +40,12 @@ interface DoneEvent {
   results: (Row & { generated_email: string })[];
 }
 
-type SSEEvent = ScrapingEvent | ProgressEvent | DoneEvent;
+interface CreditExhaustedEvent {
+  type: "credit_exhausted";
+  service: "anthropic" | "enrichlayer";
+}
+
+type SSEEvent = ScrapingEvent | ProgressEvent | DoneEvent | CreditExhaustedEvent;
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -131,6 +136,10 @@ function clientInterpolate(template: string, row: Row, urlCols: string[]): strin
   });
 }
 
+interface CreditStatus {
+  enrichlayer: { credits: number | null; error: string | null };
+}
+
 export default function Home() {
   const [columns, setColumns] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
@@ -147,6 +156,9 @@ export default function Home() {
   const [copied, setCopied] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
   const [chunkInfo, setChunkInfo] = useState<{ current: number; total: number } | null>(null);
+  const [creditStatus, setCreditStatus] = useState<CreditStatus | null>(null);
+  const [creditAlerts, setCreditAlerts] = useState<string[]>([]);
+  const creditAlertsRef = useRef<string[]>([]);
 
   // Follow-up email state
   const [followUpPrompt, setFollowUpPrompt] = useState("");
@@ -202,6 +214,14 @@ export default function Home() {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Persistence ──────────────────────────────────────────────────────────
+
+  // Fetch API credit balances on mount
+  useEffect(() => {
+    fetch("/api/credits")
+      .then((r) => r.json())
+      .then((data) => setCreditStatus(data as CreditStatus))
+      .catch(() => {});
+  }, []);
 
   // Load saved session on mount
   useEffect(() => {
@@ -327,6 +347,18 @@ export default function Home() {
           if (event.type === "scraping") onScraping(event.col, event.url);
           else if (event.type === "progress") onProgress(event.index, event.row);
           else if (event.type === "done") onDone(event.results);
+          else if (event.type === "credit_exhausted") {
+            const label = event.service === "anthropic" ? "Anthropic (Claude)" : "EnrichLayer (LinkedIn)";
+            if (!creditAlertsRef.current.includes(event.service)) {
+              creditAlertsRef.current = [...creditAlertsRef.current, event.service];
+              setCreditAlerts(creditAlertsRef.current);
+            }
+            // Refresh balance display
+            fetch("/api/credits").then((r) => r.json()).then((d) => setCreditStatus(d as CreditStatus)).catch(() => {});
+            // Stop generation immediately
+            abortRef.current?.abort();
+            console.warn(`[Credit exhausted] ${label}`);
+          }
         } catch { /* skip malformed */ }
       }
     }
@@ -599,15 +631,72 @@ export default function Home() {
               variables, and generate personalized emails at scale — up to 10,000+ rows.
             </p>
           </div>
-          {(rows.length > 0 || results.filter(Boolean).length > 0) && (
-            <button
-              onClick={clearSession}
-              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-red-900 border border-gray-700 hover:border-red-700 text-gray-400 hover:text-red-300 transition-colors"
-            >
-              ✕ Clear session
-            </button>
-          )}
+          <div className="flex flex-col items-end gap-2 shrink-0">
+            {/* Credit monitor */}
+            <div className="flex items-center gap-2 flex-wrap justify-end">
+              {/* EnrichLayer */}
+              {creditStatus && (
+                <div
+                  className={`flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border ${
+                    creditAlerts.includes("enrichlayer")
+                      ? "bg-red-900/50 border-red-600 text-red-300"
+                      : creditStatus.enrichlayer.credits !== null && creditStatus.enrichlayer.credits < 50
+                      ? "bg-yellow-900/50 border-yellow-600 text-yellow-300"
+                      : "bg-gray-800 border-gray-700 text-gray-400"
+                  }`}
+                >
+                  <span>EnrichLayer:</span>
+                  {creditAlerts.includes("enrichlayer") ? (
+                    <span className="font-semibold text-red-400">⚠ Credits exhausted</span>
+                  ) : creditStatus.enrichlayer.credits !== null ? (
+                    <span className={`font-semibold ${creditStatus.enrichlayer.credits < 50 ? "text-yellow-300" : "text-green-400"}`}>
+                      {creditStatus.enrichlayer.credits} credits left
+                    </span>
+                  ) : (
+                    <span className="text-gray-500 italic">balance unavailable</span>
+                  )}
+                </div>
+              )}
+              {/* Anthropic — only shows if exhausted */}
+              {creditAlerts.includes("anthropic") && (
+                <div className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border bg-red-900/50 border-red-600 text-red-300">
+                  <span>Anthropic:</span>
+                  <span className="font-semibold text-red-400">⚠ Credits exhausted</span>
+                </div>
+              )}
+            </div>
+            {(rows.length > 0 || results.filter(Boolean).length > 0) && (
+              <button
+                onClick={clearSession}
+                className="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-red-900 border border-gray-700 hover:border-red-700 text-gray-400 hover:text-red-300 transition-colors"
+              >
+                ✕ Clear session
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Credit exhaustion banner */}
+        {creditAlerts.length > 0 && (
+          <div className="bg-red-900/40 border border-red-700 rounded-xl px-4 py-3 flex items-start gap-3">
+            <span className="text-red-400 text-lg shrink-0">⚠</span>
+            <div className="space-y-1">
+              {creditAlerts.includes("enrichlayer") && (
+                <p className="text-sm text-red-300 font-semibold">
+                  EnrichLayer credits exhausted — LinkedIn scraping has stopped.
+                  <a href="https://enrichlayer.com" target="_blank" rel="noreferrer" className="ml-2 underline text-red-200 hover:text-white">Top up credits →</a>
+                </p>
+              )}
+              {creditAlerts.includes("anthropic") && (
+                <p className="text-sm text-red-300 font-semibold">
+                  Anthropic credits exhausted — email generation has stopped.
+                  <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" className="ml-2 underline text-red-200 hover:text-white">Add credits →</a>
+                </p>
+              )}
+              <p className="text-xs text-red-400">Generation has been stopped. Top up and then resume.</p>
+            </div>
+          </div>
+        )}
 
         {/* Step 1: Upload */}
         <section className="space-y-3">

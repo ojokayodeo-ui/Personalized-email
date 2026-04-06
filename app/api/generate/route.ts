@@ -43,6 +43,8 @@ async function scrapeLinkedIn(url: string): Promise<string> {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
+      // 402 = payment required / credits exhausted
+      if (res.status === 402) return `__ENRICHLAYER_CREDITS_EXHAUSTED__`;
       return `[LinkedIn API error ${res.status}: ${errText.slice(0, 200)}]`;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -243,7 +245,12 @@ async function generateEmail(prompt: string, row: Record<string, string>): Promi
   return textBlock && textBlock.type === "text" ? textBlock.text : "";
 }
 
-async function generateEmailWithRetry(prompt: string, row: Record<string, string>, maxRetries = 6): Promise<string> {
+async function generateEmailWithRetry(
+  prompt: string,
+  row: Record<string, string>,
+  onCreditExhausted: (service: string) => void,
+  maxRetries = 6,
+): Promise<string> {
   let lastError: Error = new Error("Unknown error");
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
@@ -251,6 +258,16 @@ async function generateEmailWithRetry(prompt: string, row: Record<string, string
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       const msg = lastError.message.toLowerCase();
+      // Detect credit exhaustion — do not retry, surface immediately
+      if (
+        msg.includes("credit balance too low") ||
+        msg.includes("insufficient_quota") ||
+        msg.includes("billing_hard_limit") ||
+        (msg.includes("400") && msg.includes("credit"))
+      ) {
+        onCreditExhausted("anthropic");
+        throw lastError;
+      }
       const isTransient =
         msg.includes("429") || msg.includes("rate limit") || msg.includes("rate_limit") ||
         msg.includes("overloaded") || msg.includes("529") || msg.includes("500") ||
@@ -311,7 +328,11 @@ export async function POST(req: NextRequest) {
                 const url = row[col];
                 if (!url) return;
                 send({ type: "scraping", index: idx, col, url });
-                const text = await scrapeUrl(url);
+                let text = await scrapeUrl(url);
+                if (text === "__ENRICHLAYER_CREDITS_EXHAUSTED__") {
+                  send({ type: "credit_exhausted", service: "enrichlayer" });
+                  text = "";
+                }
                 enrichedRow[scrapedVarName(col)] = text;
                 if (text) scrapedParts.push(`[${col}]\n${text}`);
               })
@@ -340,7 +361,11 @@ export async function POST(req: NextRequest) {
             }
           }
 
-          const email = await generateEmailWithRetry(prompt, enrichedRow);
+          const email = await generateEmailWithRetry(
+            prompt,
+            enrichedRow,
+            (service) => send({ type: "credit_exhausted", service }),
+          );
           return { idx, email, row: enrichedRow };
         } catch (err) {
           return { idx, email: `Error: ${err instanceof Error ? err.message : String(err)}`, row };
