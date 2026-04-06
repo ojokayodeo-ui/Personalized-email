@@ -25,16 +25,17 @@ const ALWAYS_BLOCKED = /facebook\.com/i;
 // ── Proxycurl LinkedIn scraping ───────────────────────────────────────────
 
 async function scrapeLinkedIn(url: string): Promise<string> {
-  const apiKey = process.env.PROXYCURL_API_KEY;
+  const apiKey = process.env.ENRICHLAYER_API_KEY;
   if (!apiKey) return "";
 
   try {
     const isCompany = /linkedin\.com\/company\//i.test(url);
     const endpoint = isCompany
-      ? "https://nubela.co/proxycurl/api/linkedin/company"
-      : "https://nubela.co/proxycurl/api/v2/linkedin";
+      ? "https://enrichlayer.com/api/v2/company"
+      : "https://enrichlayer.com/api/v2/profile";
+    const paramName = isCompany ? "company_url" : "profile_url";
 
-    const res = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`, {
+    const res = await fetch(`${endpoint}?${paramName}=${encodeURIComponent(url)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(10000),
     });
