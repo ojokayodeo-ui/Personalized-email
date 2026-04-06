@@ -35,10 +35,16 @@ async function scrapeLinkedIn(url: string): Promise<string> {
       : "https://enrichlayer.com/api/v2/profile";
     const paramName = isCompany ? "company_url" : "profile_url";
 
-    const res = await fetch(`${endpoint}?${paramName}=${encodeURIComponent(url)}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(10000),
-    });
+    // Fetch profile + recent posts in parallel (posts endpoint mirrors Proxycurl's)
+    const headers = { Authorization: `Bearer ${apiKey}` };
+    const signal = AbortSignal.timeout(12000);
+
+    const [res, postsRes] = await Promise.all([
+      fetch(`${endpoint}?${paramName}=${encodeURIComponent(url)}`, { headers, signal }),
+      isCompany
+        ? Promise.resolve(null)
+        : fetch(`https://enrichlayer.com/api/v2/posts?profile_url=${encodeURIComponent(url)}&count=3`, { headers, signal }).catch(() => null),
+    ]);
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -81,6 +87,35 @@ async function scrapeLinkedIn(url: string): Promise<string> {
       if (d.education?.length) {
         const edu = d.education[0];
         parts.push(`Education: ${edu.school ?? edu.school_name ?? ""}${edu.field_of_study ? ` — ${edu.field_of_study}` : ""}`);
+      }
+
+      // Recent LinkedIn posts — merge from profile activities + dedicated posts endpoint
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let postsData: any[] = d.activities ?? d.posts ?? [];
+      if (postsRes?.ok) {
+        try {
+          const pd = await postsRes.json();
+          // EnrichLayer posts endpoint may return { posts: [...] } or an array directly
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const arr: any[] = Array.isArray(pd) ? pd : (pd?.posts ?? pd?.data ?? pd?.results ?? []);
+          if (arr.length) postsData = arr; // prefer dedicated endpoint — richer text
+        } catch { /* ignore */ }
+      }
+
+      if (postsData.length) {
+        const postLines = postsData
+          .slice(0, 3)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .map((a: any) => {
+            const text = a.text ?? a.commentary ?? a.title ?? a.description ?? a.content ?? "";
+            const status = a.activity_status ?? a.type ?? "post";
+            if (!text) return null;
+            return `- [${status}] ${String(text).slice(0, 400)}`;
+          })
+          .filter(Boolean);
+        if (postLines.length) {
+          parts.push(`Recent LinkedIn posts:\n${postLines.join("\n")}`);
+        }
       }
     }
 
