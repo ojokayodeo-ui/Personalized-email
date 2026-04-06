@@ -7,7 +7,7 @@ export const maxDuration = 300;
 const client = new Anthropic();
 
 // Hard cap on how long a single row can take (scrape + Claude)
-const ROW_TIMEOUT_MS = 80_000;
+const ROW_TIMEOUT_MS = 45_000;
 
 function interpolate(template: string, row: Record<string, string>): string {
   return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
@@ -35,16 +35,11 @@ async function scrapeLinkedIn(url: string): Promise<string> {
       : "https://enrichlayer.com/api/v2/profile";
     const paramName = isCompany ? "company_url" : "profile_url";
 
-    // Fetch profile + recent posts in parallel (posts endpoint mirrors Proxycurl's)
-    const headers = { Authorization: `Bearer ${apiKey}` };
-    const signal = AbortSignal.timeout(12000);
-
-    const [res, postsRes] = await Promise.all([
-      fetch(`${endpoint}?${paramName}=${encodeURIComponent(url)}`, { headers, signal }),
-      isCompany
-        ? Promise.resolve(null)
-        : fetch(`https://enrichlayer.com/api/v2/posts?profile_url=${encodeURIComponent(url)}&count=3`, { headers, signal }).catch(() => null),
-    ]);
+    // Single API call — one credit per profile
+    const res = await fetch(`${endpoint}?${paramName}=${encodeURIComponent(url)}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10000),
+    });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -54,7 +49,6 @@ async function scrapeLinkedIn(url: string): Promise<string> {
     const d: any = await res.json();
     const parts: string[] = [];
 
-    // Helper: EnrichLayer skills can be strings OR objects with a "name" key
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const skillName = (s: any): string => (typeof s === "string" ? s : s?.name ?? "");
 
@@ -70,52 +64,38 @@ async function scrapeLinkedIn(url: string): Promise<string> {
       if (d.full_name)   parts.push(`Name: ${d.full_name}`);
       if (d.headline)    parts.push(`Headline: ${d.headline}`);
       if (d.occupation)  parts.push(`Occupation: ${d.occupation}`);
-      if (d.summary)     parts.push(`Summary: ${String(d.summary).slice(0, 500)}`);
+      if (d.summary)     parts.push(`Summary: ${String(d.summary).slice(0, 400)}`);
       const location = [d.city, d.state, d.country_full_name].filter(Boolean).join(", ");
       if (location)      parts.push(`Location: ${location}`);
       const exp = d.experiences?.[0];
       if (exp) {
         const company = exp.company ?? exp.company_name ?? "";
         parts.push(`Current Role: ${exp.title}${company ? ` at ${company}` : ""}`);
-        if (exp.description) parts.push(`Role Description: ${String(exp.description).slice(0, 300)}`);
+        if (exp.description) parts.push(`Role Description: ${String(exp.description).slice(0, 200)}`);
       }
       if (d.skills?.length) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const skillList = (d.skills as any[]).slice(0, 10).map(skillName).filter(Boolean);
+        const skillList = (d.skills as any[]).slice(0, 8).map(skillName).filter(Boolean);
         if (skillList.length) parts.push(`Skills: ${skillList.join(", ")}`);
       }
       if (d.education?.length) {
         const edu = d.education[0];
         parts.push(`Education: ${edu.school ?? edu.school_name ?? ""}${edu.field_of_study ? ` — ${edu.field_of_study}` : ""}`);
       }
-
-      // Recent LinkedIn posts — merge from profile activities + dedicated posts endpoint
+      // Recent posts — available in profile response under activities/posts field
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let postsData: any[] = d.activities ?? d.posts ?? [];
-      if (postsRes?.ok) {
-        try {
-          const pd = await postsRes.json();
-          // EnrichLayer posts endpoint may return { posts: [...] } or an array directly
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const arr: any[] = Array.isArray(pd) ? pd : (pd?.posts ?? pd?.data ?? pd?.results ?? []);
-          if (arr.length) postsData = arr; // prefer dedicated endpoint — richer text
-        } catch { /* ignore */ }
-      }
-
-      if (postsData.length) {
-        const postLines = postsData
-          .slice(0, 3)
+      const activities: any[] = d.activities ?? d.posts ?? d.recent_activities ?? [];
+      if (activities.length) {
+        const postLines = activities
+          .slice(0, 2)
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           .map((a: any) => {
             const text = a.text ?? a.commentary ?? a.title ?? a.description ?? a.content ?? "";
-            const status = a.activity_status ?? a.type ?? "post";
             if (!text) return null;
-            return `- [${status}] ${String(text).slice(0, 400)}`;
+            return `- ${String(text).slice(0, 300)}`;
           })
           .filter(Boolean);
-        if (postLines.length) {
-          parts.push(`Recent LinkedIn posts:\n${postLines.join("\n")}`);
-        }
+        if (postLines.length) parts.push(`Recent LinkedIn posts:\n${postLines.join("\n")}`);
       }
     }
 
@@ -372,7 +352,7 @@ export async function POST(req: NextRequest) {
         Promise.race([
           processRow(row, idx),
           new Promise<{ idx: number; email: string; row: Record<string, string> }>((resolve) =>
-            setTimeout(() => resolve({ idx, email: "Error: row timed out after 80s", row }), ROW_TIMEOUT_MS)
+            setTimeout(() => resolve({ idx, email: "Error: row timed out after 45s", row }), ROW_TIMEOUT_MS)
           ),
         ]);
 

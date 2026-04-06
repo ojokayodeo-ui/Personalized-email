@@ -332,8 +332,8 @@ export default function Home() {
     }
   };
 
-  const CHUNK_SIZE = 10; // rows per request — keeps each request well under platform timeouts
-  const CHUNK_RETRIES = 3; // retry each chunk up to 3 times on network failure
+  const CHUNK_SIZE = 5; // rows per request — all processed in parallel, keeps requests fast
+  const CHUNK_RETRIES = 1; // no retries — failed chunks waste credits re-scraping
 
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
@@ -397,7 +397,7 @@ export default function Home() {
             const res = await fetch("/api/generate", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: urlColumns.length > 0 ? 3 : 5 }),
+              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: CHUNK_SIZE }),
               signal: abortRef.current.signal,
             });
             if (!res.body) continue;
