@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import Papa from "papaparse";
 
 const STORAGE_KEY = "cold-email-session-v2";
+const PROMPTS_KEY = "cold-email-saved-prompts-v1";
 
 function saveToStorage(data: object) {
   try {
@@ -155,6 +156,35 @@ export default function Home() {
   const [followUpRate, setFollowUpRate] = useState<number | null>(null);
   const [followUpPage, setFollowUpPage] = useState(0);
   const [showFollowUpPreview, setShowFollowUpPreview] = useState(false);
+
+  // ── Saved prompts ────────────────────────────────────────────────────────
+  const [savedPrompts, setSavedPrompts] = useState<{ name: string; text: string }[]>([]);
+  const [newPromptName, setNewPromptName] = useState("");
+  const [showSavedPrompts, setShowSavedPrompts] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PROMPTS_KEY);
+      if (raw) setSavedPrompts(JSON.parse(raw));
+    } catch { /* ignore */ }
+  }, []);
+
+  const persistPrompts = (list: { name: string; text: string }[]) => {
+    setSavedPrompts(list);
+    try { localStorage.setItem(PROMPTS_KEY, JSON.stringify(list)); } catch { /* ignore */ }
+  };
+
+  const saveCurrentPrompt = () => {
+    const name = newPromptName.trim();
+    if (!name || !prompt.trim()) return;
+    const updated = [{ name, text: prompt }, ...savedPrompts.filter((p) => p.name !== name)];
+    persistPrompts(updated);
+    setNewPromptName("");
+  };
+
+  const deletePrompt = (name: string) => {
+    persistPrompts(savedPrompts.filter((p) => p.name !== name));
+  };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -721,7 +751,7 @@ export default function Home() {
                           {isBlocked ? (
                             <span className="ml-auto text-xs text-yellow-500 shrink-0">⚠ blocks scraping</span>
                           ) : isLinkedIn ? (
-                            <span className="ml-auto text-xs text-blue-400 shrink-0">{isChecked ? "✓ " : ""}Proxycurl API</span>
+                            <span className="ml-auto text-xs text-blue-400 shrink-0">{isChecked ? "✓ " : ""}EnrichLayer API</span>
                           ) : isApify ? (
                             <span className="ml-auto text-xs text-green-400 shrink-0">{isChecked ? "✓ " : ""}Apify API</span>
                           ) : isChecked ? (
@@ -765,6 +795,59 @@ export default function Home() {
               </button>
             )}
           </div>
+          {/* Saved prompts library */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowSavedPrompts((v) => !v)}
+                className="text-xs px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 transition-colors"
+              >
+                {showSavedPrompts ? "▲ Hide saved prompts" : `▼ Saved prompts${savedPrompts.length ? ` (${savedPrompts.length})` : ""}`}
+              </button>
+              <input
+                type="text"
+                placeholder="Name this prompt…"
+                value={newPromptName}
+                onChange={(e) => setNewPromptName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") saveCurrentPrompt(); }}
+                className="flex-1 min-w-0 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1 text-xs text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500"
+              />
+              <button
+                onClick={saveCurrentPrompt}
+                disabled={!newPromptName.trim() || !prompt.trim()}
+                className="text-xs px-3 py-1 rounded-lg bg-blue-700 hover:bg-blue-600 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              >
+                💾 Save
+              </button>
+            </div>
+
+            {showSavedPrompts && (
+              <div className="bg-gray-900 border border-gray-700 rounded-xl divide-y divide-gray-800">
+                {savedPrompts.length === 0 ? (
+                  <p className="px-4 py-3 text-xs text-gray-500 italic">No saved prompts yet. Write a prompt and click Save.</p>
+                ) : (
+                  savedPrompts.map((sp) => (
+                    <div key={sp.name} className="flex items-center gap-2 px-4 py-2.5">
+                      <span className="flex-1 text-sm text-gray-300 truncate">{sp.name}</span>
+                      <button
+                        onClick={() => { setPrompt(sp.text); setShowSavedPrompts(false); }}
+                        className="text-xs px-2.5 py-1 rounded bg-blue-800 hover:bg-blue-600 text-blue-200 hover:text-white transition-colors shrink-0"
+                      >
+                        Load
+                      </button>
+                      <button
+                        onClick={() => deletePrompt(sp.name)}
+                        className="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-red-900 text-gray-500 hover:text-red-300 transition-colors shrink-0"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
           <textarea
             className="w-full h-56 bg-gray-900 border border-gray-700 rounded-xl p-4 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-blue-500 resize-y font-mono"
             placeholder={`Click "Generate sample prompt" above to get a ready-to-use template, or write your own.\n\nUse {First Name}, {Company Name}, {scraped_content} etc. to inject lead data.\n\nExample:\n\nWrite a short cold email to {First Name} at {Company Name}.\nResearch: {scraped_content}\nKeep it under 100 words. End with a CTA.`}
