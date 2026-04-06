@@ -397,7 +397,7 @@ export default function Home() {
             const res = await fetch("/api/generate", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: 5 }),
+              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: urlColumns.length > 0 ? 3 : 5 }),
               signal: abortRef.current.signal,
             });
             if (!res.body) continue;
@@ -854,6 +854,46 @@ export default function Home() {
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
           />
+          {/* Scraped variable mismatch warning */}
+          {(() => {
+            const usedScrapedVars = [...prompt.matchAll(/\{(scraped_[^}]+)\}/g)].map((m) => m[1]);
+            const validScrapedKeys = new Set([
+              "scraped_content",
+              ...urlColumns.map(scrapedVarName),
+            ]);
+            const mismatches = usedScrapedVars.filter((v) => !validScrapedKeys.has(v));
+            if (!mismatches.length) return null;
+            return (
+              <div className="bg-yellow-900/30 border border-yellow-700 rounded-lg px-4 py-3 space-y-2">
+                <p className="text-xs font-semibold text-yellow-300">
+                  ⚠ Variable mismatch — these will NOT be replaced:
+                </p>
+                {mismatches.map((v) => {
+                  // Find closest matching selected column
+                  const closest = urlColumns.find((c) =>
+                    scrapedVarName(c).toLowerCase() === v.toLowerCase()
+                  );
+                  return (
+                    <p key={v} className="text-xs text-yellow-200 font-mono">
+                      {"{" + v + "}"}{closest ? (
+                        <span className="text-yellow-400 font-sans"> → did you mean{" "}
+                          <button
+                            onClick={() => setPrompt((p) => p.replace(new RegExp(`\\{${v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\}`, "g"), `{${scrapedVarName(closest)}}`))
+                            }
+                            className="underline hover:text-white"
+                          >
+                            {"{" + scrapedVarName(closest) + "}"} (click to fix)
+                          </button>
+                        </span>
+                      ) : (
+                        <span className="text-yellow-400 font-sans"> — no matching URL column selected in Step 2</span>
+                      )}
+                    </p>
+                  );
+                })}
+              </div>
+            );
+          })()}
           <div className="flex items-center justify-between flex-wrap gap-2">
             <p className="text-xs text-gray-500">
               Your prompt <strong className="text-gray-300">must include</strong> variables like{" "}

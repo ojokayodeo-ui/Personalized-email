@@ -7,7 +7,7 @@ export const maxDuration = 300;
 const client = new Anthropic();
 
 // Hard cap on how long a single row can take (scrape + Claude)
-const ROW_TIMEOUT_MS = 55_000;
+const ROW_TIMEOUT_MS = 80_000;
 
 function interpolate(template: string, row: Record<string, string>): string {
   return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
@@ -337,7 +337,7 @@ export async function POST(req: NextRequest) {
         Promise.race([
           processRow(row, idx),
           new Promise<{ idx: number; email: string; row: Record<string, string> }>((resolve) =>
-            setTimeout(() => resolve({ idx, email: "Error: row timed out after 55s", row }), ROW_TIMEOUT_MS)
+            setTimeout(() => resolve({ idx, email: "Error: row timed out after 80s", row }), ROW_TIMEOUT_MS)
           ),
         ]);
 
