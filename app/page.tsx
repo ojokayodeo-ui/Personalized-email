@@ -20,13 +20,6 @@ function saveToStorage(data: object) {
 
 type Row = Record<string, string>;
 
-interface ScrapingEvent {
-  type: "scraping";
-  index: number;
-  col: string;
-  url: string;
-}
-
 interface ProgressEvent {
   type: "progress";
   completed: number;
@@ -45,7 +38,7 @@ interface CreditExhaustedEvent {
   service: "anthropic" | "enrichlayer";
 }
 
-type SSEEvent = ScrapingEvent | ProgressEvent | DoneEvent | CreditExhaustedEvent;
+type SSEEvent = ProgressEvent | DoneEvent | CreditExhaustedEvent;
 
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -324,10 +317,9 @@ export default function Home() {
     }, 250);
   }, [flushResults]);
 
-  // Read one SSE stream and call handlers for each event
+  // Read the SSE stream from /api/generate
   const readStream = async (
     body: ReadableStream<Uint8Array>,
-    onScraping: (col: string, url: string) => void,
     onProgress: (localIndex: number, row: Row & { generated_email: string }) => void,
     onDone: (results: (Row & { generated_email: string })[]) => void,
   ) => {
@@ -344,39 +336,83 @@ export default function Home() {
         if (!line.startsWith("data: ")) continue;
         try {
           const event: SSEEvent = JSON.parse(line.slice(6));
-          if (event.type === "scraping") onScraping(event.col, event.url);
-          else if (event.type === "progress") onProgress(event.index, event.row);
+          if (event.type === "progress") onProgress(event.index, event.row);
           else if (event.type === "done") onDone(event.results);
           else if (event.type === "credit_exhausted") {
-            const label = event.service === "anthropic" ? "Anthropic (Claude)" : "EnrichLayer (LinkedIn)";
             if (!creditAlertsRef.current.includes(event.service)) {
               creditAlertsRef.current = [...creditAlertsRef.current, event.service];
               setCreditAlerts(creditAlertsRef.current);
             }
-            // Refresh balance display
             fetch("/api/credits").then((r) => r.json()).then((d) => setCreditStatus(d as CreditStatus)).catch(() => {});
-            // Stop generation immediately
             abortRef.current?.abort();
-            console.warn(`[Credit exhausted] ${label}`);
           }
         } catch { /* skip malformed */ }
       }
     }
   };
 
-  const CHUNK_SIZE = 5; // rows per request — all processed in parallel, keeps requests fast
-  const CHUNK_RETRIES = 1; // no retries — failed chunks waste credits re-scraping
+  // Phase 1: call /api/scrape and return enriched rows (scraped_ fields merged in)
+  const scrapeChunk = async (
+    chunkRows: Row[],
+    signal: AbortSignal,
+  ): Promise<{ enrichedRows: Row[]; creditExhausted: boolean }> => {
+    if (urlColumns.length === 0) return { enrichedRows: chunkRows, creditExhausted: false };
+
+    const items = chunkRows.flatMap((row, rowIndex) =>
+      urlColumns
+        .filter((col) => row[col])
+        .map((col) => ({ rowIndex, col, url: row[col] }))
+    );
+
+    if (items.length === 0) return { enrichedRows: chunkRows, creditExhausted: false };
+
+    try {
+      setScrapingInfo({ col: "all URL columns", url: `${items.length} URLs…` });
+      const res = await fetch("/api/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+        signal,
+      });
+      if (!res.ok) return { enrichedRows: chunkRows, creditExhausted: false };
+
+      const { results: scraped, creditExhausted } = await res.json() as {
+        results: { rowIndex: number; col: string; text: string }[];
+        creditExhausted: boolean;
+      };
+
+      // Merge scraped text into each row
+      const enrichedRows = chunkRows.map((row, rowIndex) => {
+        const enriched = { ...row };
+        const parts: string[] = [];
+        for (const { rowIndex: ri, col, text } of scraped) {
+          if (ri !== rowIndex) continue;
+          enriched[scrapedVarName(col)] = text;
+          if (text && !text.startsWith("[")) parts.push(`[${col}]\n${text}`);
+        }
+        if (parts.length) enriched["scraped_content"] = parts.join("\n\n---\n\n");
+        return enriched;
+      });
+
+      setScrapingInfo(null);
+      return { enrichedRows, creditExhausted: !!creditExhausted };
+    } catch {
+      setScrapingInfo(null);
+      return { enrichedRows: chunkRows, creditExhausted: false };
+    }
+  };
+
+  const CHUNK_SIZE = 5;
 
   const handleGenerate = async () => {
     if (!rows.length || !prompt.trim()) return;
 
-    // ── Resume detection ────────────────────────────────────────────────────
     const existing = results.filter(Boolean);
     const hasPartial = existing.length > 0 && existing.length < rows.length;
     let resuming = false;
     if (hasPartial) {
       resuming = confirm(
-        `You have ${existing.length.toLocaleString()} / ${rows.length.toLocaleString()} rows already done.\n\nOK = resume from row ${(existing.length + 1).toLocaleString()}\nCancel = start over from row 1`
+        `You have ${existing.length.toLocaleString()} / ${rows.length.toLocaleString()} rows already done.\n\nOK = resume\nCancel = start over`
       );
     }
 
@@ -385,9 +421,10 @@ export default function Home() {
     setChunkInfo(null);
     setRate(null);
     setPreviewPage(0);
+    creditAlertsRef.current = [];
+    setCreditAlerts([]);
 
     if (resuming) {
-      // Keep existing results; pending ref starts from saved state
       pendingResultsRef.current = [...results];
       completedRef.current = existing.length;
       setProgress({ completed: existing.length, total: rows.length });
@@ -401,7 +438,6 @@ export default function Home() {
     startTimeRef.current = Date.now();
     abortRef.current = new AbortController();
 
-    // Build list of rows that still need processing (skip completed when resuming)
     const todo = rows
       .map((row, globalIndex) => ({ row, globalIndex }))
       .filter(({ globalIndex }) => !pendingResultsRef.current[globalIndex]);
@@ -418,45 +454,51 @@ export default function Home() {
 
         setChunkInfo({ current: Math.floor(c / CHUNK_SIZE) + 1, total: totalChunks });
 
-        // ── Per-chunk retry loop ───────────────────────────────────────────
-        let chunkDone = false;
-        for (let attempt = 0; attempt < CHUNK_RETRIES && !chunkDone; attempt++) {
-          if (attempt > 0) {
-            // Brief back-off before retry
-            await new Promise((r) => setTimeout(r, 1500 * attempt));
-          }
-          try {
-            const res = await fetch("/api/generate", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ rows: chunkRows, prompt, urlColumns, batchSize: CHUNK_SIZE }),
-              signal: abortRef.current.signal,
-            });
-            if (!res.body) continue;
+        // ── Phase 1: Scrape (fast, separate request, no Claude) ───────────
+        const { enrichedRows, creditExhausted } = await scrapeChunk(
+          chunkRows,
+          abortRef.current.signal,
+        );
 
-            await readStream(
-              res.body,
-              (col, url) => setScrapingInfo({ col, url }),
-              (localIndex, row) => {
-                const globalIndex = globalIndices[localIndex];
-                setScrapingInfo(null);
-                pendingResultsRef.current[globalIndex] = row;
-                completedRef.current++;
-                setProgress({ completed: completedRef.current, total: rows.length });
-                scheduleFlush();
-              },
-              (chunkResults) => {
-                chunkResults.forEach((row, localIdx) => {
-                  if (row) pendingResultsRef.current[globalIndices[localIdx]] = row;
-                });
-                chunkDone = true;
-              },
-            );
-            chunkDone = true;
-          } catch (err) {
-            if (err instanceof Error && err.name === "AbortError") throw err;
-            console.warn(`Chunk ${c} attempt ${attempt + 1} failed:`, err);
+        if (creditExhausted) {
+          if (!creditAlertsRef.current.includes("enrichlayer")) {
+            creditAlertsRef.current = [...creditAlertsRef.current, "enrichlayer"];
+            setCreditAlerts(creditAlertsRef.current);
           }
+          fetch("/api/credits").then((r) => r.json()).then((d) => setCreditStatus(d as CreditStatus)).catch(() => {});
+          break;
+        }
+
+        if (abortRef.current.signal.aborted) break;
+
+        // ── Phase 2: Generate emails (fast, no scraping, just Claude) ─────
+        try {
+          const res = await fetch("/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rows: enrichedRows, prompt, batchSize: CHUNK_SIZE }),
+            signal: abortRef.current.signal,
+          });
+          if (!res.body) continue;
+
+          await readStream(
+            res.body,
+            (localIndex, row) => {
+              const globalIndex = globalIndices[localIndex];
+              pendingResultsRef.current[globalIndex] = row;
+              completedRef.current++;
+              setProgress({ completed: completedRef.current, total: rows.length });
+              scheduleFlush();
+            },
+            (chunkResults) => {
+              chunkResults.forEach((row, localIdx) => {
+                if (row) pendingResultsRef.current[globalIndices[localIdx]] = row;
+              });
+            },
+          );
+        } catch (err) {
+          if (err instanceof Error && err.name === "AbortError") throw err;
+          console.warn(`Generate chunk ${c} failed:`, err);
         }
       }
     } catch (err) {
@@ -548,7 +590,6 @@ export default function Home() {
           body: JSON.stringify({
             rows: chunk,
             prompt: followUpPrompt,
-            urlColumns: [],
             outputColumn: "follow_up_email",
             batchSize: 5,
           }),
@@ -558,7 +599,6 @@ export default function Home() {
 
         await readStream(
           res.body,
-          () => {},
           (localIndex, row) => {
             const globalIndex = chunkStart + localIndex;
             followUpPendingRef.current[globalIndex] = row;
