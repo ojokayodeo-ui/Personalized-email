@@ -5,8 +5,20 @@ export const maxDuration = 300;
 
 const client = new Anthropic();
 
-// Per-row hard cap: Claude generation only (no scraping here)
 const ROW_TIMEOUT_MS = 30_000;
+
+// Strict grounding instruction — sent as system on every generation call.
+// Prevents Claude from inventing facts not present in the provided data.
+const SYSTEM_PROMPT = `You are an email copywriter. Your ONLY job is to write emails using the exact information provided in the prompt — nothing more.
+
+STRICT RULES:
+- Use ONLY facts, details, and phrases explicitly present in the data given to you.
+- Do NOT invent, assume, or infer any information that is not in the prompt.
+- Do NOT add generic compliments, filler observations, or assumed context about the person's company, role, or industry.
+- If a detail (e.g. a recent post, a website insight) is not in the provided data, do NOT mention it or make something up to fill the gap — simply omit it.
+- If the scraped content is an error message or placeholder, ignore it entirely and write based only on the CSV fields provided.
+- Every claim in the email must be traceable to a specific field or scraped text in the prompt.
+- Write naturally and concisely. Do not over-explain or pad.`;
 
 function interpolate(template: string, row: Record<string, string>): string {
   return template.replace(/\{([^}]+)\}/g, (_, key) => row[key] ?? `{${key}}`);
@@ -17,6 +29,7 @@ async function generateEmail(prompt: string, row: Record<string, string>): Promi
   const stream = await client.messages.stream({
     model: "claude-opus-4-6",
     max_tokens: 1024,
+    system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
   });
   const msg = await stream.finalMessage();
@@ -95,9 +108,15 @@ export async function POST(req: NextRequest) {
         idx: number,
       ): Promise<{ idx: number; email: string; row: Record<string, string> }> => {
         try {
-          // Fallback: if no scraped_content pre-populated, build from CSV data
-          const enrichedRow = { ...row };
-          if (!enrichedRow["scraped_content"]) {
+          // 1. Copy row and strip scraping error strings — Claude must never see them
+          const enrichedRow: Record<string, string> = {};
+          const isErrorText = (v: string) => /^\[(LinkedIn|scrape error|Website unavail)/i.test(v);
+          for (const [k, v] of Object.entries(row)) {
+            enrichedRow[k] = (k.startsWith("scraped_") && isErrorText(v)) ? "" : v;
+          }
+
+          // 2. If scraped_content is empty/error after cleanup, build from CSV fields only
+          if (!enrichedRow["scraped_content"] || isErrorText(enrichedRow["scraped_content"])) {
             const parts = Object.entries(row)
               .filter(([k, v]) =>
                 v &&
@@ -109,7 +128,9 @@ export async function POST(req: NextRequest) {
               )
               .map(([k, v]) => `${k}: ${v}`)
               .join("\n");
-            if (parts) enrichedRow["scraped_content"] = `[Using lead profile data]\n${parts}`;
+            enrichedRow["scraped_content"] = parts
+              ? `[No web/LinkedIn data — write using ONLY the CSV fields below. Do NOT invent website or social media details.]\n${parts}`
+              : "[No additional data. Use only the fields in this prompt. Do not invent anything.]";
           }
 
           const email = await generateEmailWithRetry(
