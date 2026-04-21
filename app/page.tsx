@@ -664,7 +664,13 @@ export default function Home() {
         {/* Header */}
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-3xl font-bold text-white">Cold Email Personalizer</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-3xl font-bold text-white">Cold Email Personalizer</h1>
+              <a href="/agent"
+                className="text-xs px-3 py-1.5 rounded-lg bg-indigo-900/60 hover:bg-indigo-800 border border-indigo-700 text-indigo-300 hover:text-white transition-colors font-medium">
+                ✍️ Copywriting Agent →
+              </a>
+            </div>
             <p className="mt-1 text-gray-400 text-sm">
               Upload a CSV, scrape lead websites automatically, write a prompt using{" "}
               <code className="bg-gray-800 px-1 rounded text-blue-400">{"{column_name}"}</code>{" "}
